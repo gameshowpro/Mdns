@@ -4,17 +4,17 @@ namespace GameshowPro.Mdns;
 
 public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonitor
 {
-    public event Action<IMdnsMatchedService>? ServiceWasSelected;
+    public event Action<object, IMdnsMatchedService>? ServiceWasSelected;
     private static readonly string s_machineNamePrefix = TxtRecordMachineName + "=";
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<IPEndPoint, Stopwatch>> _foundHosts = [];
     private readonly ConcurrentDictionary<IPEndPoint, string> _foundAddresses = [];
     private readonly string? _ignoredMachineName;
     internal MatchedServicesMonitor(IMdnsServiceSearchProfile searchProfile, string thisMachineName)
     {
-        MatchedServiceSelectedCommand = new(s => {
-            if (s != null)
+        MatchedServiceSelectedCommand = new(contextAndService => {
+            if (contextAndService?.Length > 1 && contextAndService[1] is IMdnsMatchedService service)
             {
-                ServiceWasSelected?.Invoke(s);
+                ServiceWasSelected?.Invoke(contextAndService[0], service);
             }
         });
         SearchProfile = searchProfile;
@@ -34,7 +34,7 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
         set => _ = SetProperty(ref _services, value);
     }
 
-    public RelayCommand<IMdnsMatchedService> MatchedServiceSelectedCommand { get; }
+    public RelayCommand<object[]> MatchedServiceSelectedCommand { get; }
 
     internal void Discovered(ServiceInstanceDiscoveryEventArgs args)
     {
