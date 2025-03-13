@@ -23,7 +23,7 @@ public class AdvertisedService
         _instanceProperties = instanceProperties;
         _logger = logger;
         ThisMachineName = thisMachineName;
-        Profile = new(_instanceProperties.InstanceName, _instanceProperties.ServiceType + "._" + _instanceProperties.Protocol, _instanceProperties.Port);
+        Profile = new(ThisMachineName, _instanceProperties.ServiceType + "._" + _instanceProperties.Protocol, _instanceProperties.Port);
         Profile.AddProperty(TxtRecordMachineName, ThisMachineName);
     }
 
