@@ -38,7 +38,7 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
 
     internal void Discovered(ServiceInstanceDiscoveryEventArgs args)
     {
-        string? machineName = GetMachineNameFromTxt(args.Message);
+        string? machineName = GetMachineNameFromTxt(args.Message) ?? args.ServiceInstanceName.Labels.FirstOrDefault();
 
         if (machineName != null && (_ignoredMachineName == null || machineName != _ignoredMachineName))
         {
