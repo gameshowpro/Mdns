@@ -4,10 +4,12 @@ namespace GameshowPro.Mdns;
 
 public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonitor
 {
+    private record FoundHost(string HostName, int Port, ConcurrentDictionary<IPAddress, Stopwatch> Addresses);
+    private record MessageRecords(SRVRecord? Srv, ImmutableArray<ARecord> A);
     public event Action<object, IMdnsMatchedService>? ServiceWasSelected;
     private static readonly string s_machineNamePrefix = TxtRecordMachineName + "=";
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<IPEndPoint, Stopwatch>> _foundHosts = [];
-    private readonly ConcurrentDictionary<IPEndPoint, string> _foundAddresses = [];
+    private readonly ConcurrentDictionary<string, FoundHost> _foundHosts = [];
+    private readonly ConcurrentDictionary<IPAddress, string> _foundAddresses = [];
     private readonly string? _ignoredMachineName;
     internal MatchedServicesMonitor(IMdnsServiceSearchProfile searchProfile, string thisMachineName)
     {
@@ -38,35 +40,61 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
 
     internal void Discovered(ServiceInstanceDiscoveryEventArgs args)
     {
-        string? machineName = GetMachineNameFromTxt(args.Message) ?? args.ServiceInstanceName.Labels.FirstOrDefault();
+        MessageRecords records = MessageToRecords(args.Message);
 
-        if (machineName != null && (_ignoredMachineName == null || machineName != _ignoredMachineName))
+        if (records.Srv != null  && (_ignoredMachineName == null || !records.Srv.Target.Labels[0].Equals(_ignoredMachineName, StringComparison.InvariantCultureIgnoreCase)) && records.A.Length > 0)
         {
-            ConcurrentDictionary<IPEndPoint, Stopwatch> addresses = _foundHosts.GetOrAdd(machineName, (a) => new ConcurrentDictionary<IPEndPoint, Stopwatch>());
-            addresses.AddOrUpdate(args.RemoteEndPoint, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
-            _foundAddresses.AddOrUpdate(args.RemoteEndPoint, machineName, (address, old) => machineName);
+            FoundHost foundHost = _foundHosts.GetOrAdd(records.Srv.CanonicalName, (a) => new FoundHost(records.Srv.Name.Labels[0], records.Srv.Port, new ConcurrentDictionary<IPAddress, Stopwatch>()));
+            foreach (ARecord a in records.A)
+            {
+                foundHost.Addresses.AddOrUpdate(a.Address, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
+                _foundAddresses.AddOrUpdate(a.Address, records.Srv.CanonicalName, (address, old) => records.Srv.CanonicalName);
+
+            }
             UpdateConflictingServices();
         }
     }
 
+    private static MessageRecords MessageToRecords(Message message)
+    {
+        SRVRecord? srv = (SRVRecord?)message.Answers.FirstOrDefault(r => r is SRVRecord) ?? 
+                         (SRVRecord?)message.AdditionalRecords.FirstOrDefault(r => r is SRVRecord);
+        
+        ImmutableArray<ARecord> aRecords = [
+            .. message.Answers.Where(r => r is ARecord).Select(r => (ARecord)r),
+            .. message.AdditionalRecords.Where(r => r is ARecord).Select(r => (ARecord)r)
+        ];
+        
+        return new MessageRecords(srv, aRecords);
+    }
+
     internal void Shutdown(ServiceInstanceShutdownEventArgs args)
     {
-        if (_foundAddresses.TryRemove(args.RemoteEndPoint, out string? machineName))
+        MessageRecords records = MessageToRecords(args.Message);
+        foreach (ARecord a in records.A)
         {
-            if (_foundHosts.TryRemove(machineName, out _)) // Remove all records with this host name, because we might not get message for every individual address
+            if (_foundAddresses.TryRemove(a.Address, out string? serviceInstanceName))
             {
-                UpdateConflictingServices();
+                if (_foundHosts.TryRemove(serviceInstanceName, out _)) // Remove all records with this host name, because we might not get message for every individual address
+                {
+                    UpdateConflictingServices();
+                }
             }
         }
+            
     }
 
     internal void AnswerReceived(MessageEventArgs args)
     {
-        if (_foundAddresses.TryGetValue(args.RemoteEndPoint, out string? machineName))
+        MessageRecords records = MessageToRecords(args.Message);
+        foreach (ARecord a in records.A)
         {
-            if (_foundHosts.TryGetValue(machineName, out ConcurrentDictionary<IPEndPoint, Stopwatch>? addresses))
+            if (_foundAddresses.TryGetValue(a.Address, out string? serviceInstanceName))
             {
-                addresses.AddOrUpdate(args.RemoteEndPoint, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
+                if (_foundHosts.TryGetValue(serviceInstanceName, out FoundHost? foundHost))
+                {
+                    foundHost.Addresses.AddOrUpdate(a.Address, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
+                }
             }
         }
     }
@@ -76,17 +104,17 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
         bool change = false;
         try
         {
-            foreach (KeyValuePair<string, ConcurrentDictionary<IPEndPoint, Stopwatch>> ha in _foundHosts)
+            foreach (KeyValuePair<string, FoundHost> foundHostPair in _foundHosts)
             {
-                ImmutableArray<IPEndPoint> expiredAddresses = [.. ha.Value.Where(a => a.Value.Elapsed > TimeSpan.FromSeconds(15)).Select(a => a.Key)];
+                ImmutableArray<IPAddress> expiredAddresses = [.. foundHostPair.Value.Addresses.Where(a => a.Value.Elapsed > TimeSpan.FromSeconds(15)).Select(a => a.Key)];
                 expiredAddresses.ForEach(expired =>
                 {
-                    ha.Value.TryRemove(expired, out _);
+                    foundHostPair.Value.Addresses.TryRemove(expired, out _);
                     _foundAddresses.TryRemove(expired, out _);
                 });
                 change = expiredAddresses.Length > 0;
             }
-            ImmutableArray<string> expiredHosts = [.. _foundHosts.Where(ha => ha.Value.IsEmpty).Select(ha => ha.Key)];
+            ImmutableArray<string> expiredHosts = [.. _foundHosts.Where(ha => ha.Value.Addresses.IsEmpty).Select(ha => ha.Key)];
             expiredHosts.ForEach(expired =>
             {
                 _foundHosts.TryRemove(expired, out _);
@@ -104,12 +132,9 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
     {
         Services = [.. _foundHosts
                 .OrderBy(ha => ha.Key)
-                .Select(ha => new MdnsMatchedService(this, ha.Key, [.. ha.Value.Select((a, s) => a.Key)]))
+                .Select(ha => new MdnsMatchedService(this, ha.Value.HostName, ha.Value.Port, [.. ha.Value.Addresses.Select((a, s) => a.Key)]))
         ];
     }
-
-    static string? GetMachineNameFromTxt(Message message)
-        => GetMachineNameFromRecords(message.Answers) ?? GetMachineNameFromRecords(message.AdditionalRecords);
 
     static string? GetMachineNameFromRecords(List<ResourceRecord> records)
         => records.SelectMany(a => a is TXTRecord txt ? txt.Strings : []).Where(s => s.StartsWith(s_machineNamePrefix)).FirstOrDefault()?[s_machineNamePrefix.Length..];

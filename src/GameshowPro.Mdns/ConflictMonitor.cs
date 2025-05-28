@@ -37,4 +37,4 @@ public class ConflictMonitor : ObservableClass
     }
 }
 
-public record MdnsMatchedService(IMdnsMatchedServicesMonitor Parent, string HostName, ImmutableArray<IPEndPoint> Endpoints) : IMdnsMatchedService;   
+public record MdnsMatchedService(IMdnsMatchedServicesMonitor Parent, string HostName, int Port, ImmutableArray<IPAddress> Addresses) : IMdnsMatchedService;   
