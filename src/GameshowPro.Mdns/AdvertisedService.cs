@@ -47,6 +47,7 @@ public class AdvertisedService
         {
             await Task.Delay(Timeout.Infinite, cancellationToken);
         }
+        catch { }
         finally
         {
             serviceDiscovery.Unadvertise(Profile);
