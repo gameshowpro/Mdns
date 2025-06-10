@@ -44,6 +44,9 @@ jobs:
       with:
         setAllVars: true
 
+    - name: Add nuget source
+      run: dotnet nuget add source --username ${{ vars.GSP_PACKAGE_USERNAME }} --password ${{ secrets.GSP_PACKAGE_PAT }} --store-password-in-clear-text --name github ${{ vars.NUGET_URL }}
+
     - name: Run tests
       run: dotnet test $env:SLN_PATH -c Release
 
