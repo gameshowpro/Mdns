@@ -1,0 +1,71 @@
+on:
+  push:
+    branches:
+      - main
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  Build_And_Package:
+    name: Build and package
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        ChannelName:
+        - Release
+
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+      DOTNET_NOLOGO: true
+      BuildConfiguration: Release
+      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+      SLN_PATH: .\src\GameshowPro.Mdns.csproj
+      PUBLISH_PATH: .\publish
+      PACKAGE_GLOB: ./publish/*.nupkg
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # avoid shallow clone so nbgv can do its work.
+
+    - name: Use .NET 9.0.x
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+        dotnet-quality: 'ga'
+
+    - name: Nerdbank.GitVersioning
+      uses: dotnet/nbgv@v0.4.1
+      with:
+        setAllVars: true
+
+    - name: Run tests
+      run: dotnet test $env:SLN_PATH -c Release
+
+    - name: Build release packages
+      run: |
+        dotnet pack $env:SLN_PATH --output $env:PUBLISH_PATH -c Release
+
+    - name: Publish NuGet package
+      run: |
+        foreach($file in (Get-ChildItem "${{ env.PUBLISH_PATH }}" -Recurse -Include *.nupkg)) {
+            dotnet nuget push $file --api-key "${{ secrets.GSP_PACKAGE_PAT }}" --source https://nuget.pkg.github.com/gameshowpro/index.json --skip-duplicate
+        }
+
+    - name: Add tags
+      id: addTags
+      shell: pwsh
+      run: |
+        nbgv tag 
+        git push origin "v$env:NBGV_NuGetPackageVersion"
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ env.NBGV_NuGetPackageVersion }}
+        files: ${{ env.PACKAGE_GLOB }}

@@ -8,8 +8,16 @@
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.5" />
 	</ItemGroup>
-	<ItemGroup>
-		<ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
-		<ProjectReference Include="..\..\..\Common\src\GameshowPro.Common\GameshowPro.Common.csproj" />
-	</ItemGroup>
+  <ItemGroup>
+    <Choose>
+      <When Condition="'$(GP_COMMON)' != ''">
+        <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
+        <ProjectReference Include="$(GP_COMMON)GameshowPro.Common\GameshowPro.Common.csproj" />
+      </When>
+      <Otherwise>
+        <PackageReference Include="GameshowPro.Common" Version="1.1.43" />
+        <PackageReference Include="Makaretu.Dns.Multicast.Gsp " Version="1.0.6" />
+      </Otherwise>
+    </Choose>
+  </ItemGroup>
 </Project>
