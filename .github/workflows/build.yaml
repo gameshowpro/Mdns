@@ -24,7 +24,7 @@ jobs:
       DOTNET_NOLOGO: true
       BuildConfiguration: Release
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-      SLN_PATH: .\src\GameshowPro.Mdns.csproj
+      SLN_PATH: .\src\GameshowPro.Mdns\GameshowPro.Mdns.csproj
       PUBLISH_PATH: .\publish
       PACKAGE_GLOB: ./publish/*.nupkg
 
