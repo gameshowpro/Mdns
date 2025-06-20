@@ -1,4 +1,6 @@
-﻿namespace GameshowPro.Mdns;
+﻿using Message = Makaretu.Dns.Message;
+
+namespace GameshowPro.Mdns;
 
 /// <summary>
 /// Allows clients to specify a service they require and receive a list of available options.

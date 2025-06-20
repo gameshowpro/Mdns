@@ -1,42 +1,57 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
-
+  <Choose>
+    <When Condition="'$(Configuration)' == 'ReleaseWindows' OR '$(Configuration)' == 'DebugWindows'">
+      <PropertyGroup>
+        <TargetFrameworks>net8.0-windows;net9.0-windows</TargetFrameworks>
+        <DefineConstants>$(DefineConstants);WPF</DefineConstants>
+        <Title>GameshowPro mDNS wrapper - Windows version</Title>
+        <UseWpf>true</UseWpf>
+        <UseWindowsForms>true</UseWindowsForms>
+        <PackageId>GameshowPro.Mdns.Windows</PackageId>
+      </PropertyGroup>
+    </When>
+    <Otherwise>
+      <PropertyGroup>
+        <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+        <Title>GameshowPro mDNS wrapper - Cross platform version</Title>
+        <PackageId>GameshowPro.Mdns</PackageId>
+      </PropertyGroup>
+    </Otherwise>
+  </Choose>
   <PropertyGroup>
-    
-    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <PackageId>GameshowPro.Mdns</PackageId>
     <Authors>Hamish Barjonas</Authors>
-    <Title>GameshowPro mDNS wrapper</Title>
+    <Product>GameshowPro mDNS wrapper</Product>
     <Description>A wrapper around a lower level mDNS implemenation to allow easy and consistent implementation within GameShowPro applications.</Description>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
-    <PackageReleaseNotes>https://github.com/jdomnitz/net-mdns/releases</PackageReleaseNotes>
     <Copyright>© 2025 Barjonas LLC</Copyright>
     <PackageTags>multicast mdns dns zeroconf</PackageTags>
     <IncludeSymbols>True</IncludeSymbols>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
+    <Configurations>Debug;Release;ReleaseWindows;DebugWindows</Configurations>
+    <OutputPath>bin\$(Configuration)</OutputPath>
   </PropertyGroup>
   <ItemGroup>
     <None Include="..\..\readme.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 	<ItemGroup>
-		<PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.5" />
     <PackageReference Include="Nerdbank.GitVersioning" Version="3.7.115">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
 	</ItemGroup>
   <Choose>
-    <When Condition="'$(GP_COMMON)' != ''">
+    <When Condition="Exists('$(GP_COMMON)')">
       <ItemGroup>
-        <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
         <ProjectReference Include="$(GP_COMMON)GameshowPro.Common\GameshowPro.Common.csproj" />
+        <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
       </ItemGroup>
     </When>
     <Otherwise>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common" Version="1.1.43" />
+        <PackageReference Include="GameshowPro.Common" Version="1.1.47" />
         <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
       </ItemGroup>
     </Otherwise>

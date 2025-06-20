@@ -1,5 +1,6 @@
-﻿using GameshowPro.Common.ViewModel;
-
+﻿#if WPF
+using GameshowPro.Common.ViewModel;
+#endif
 namespace GameshowPro.Mdns;
 
 public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonitor
@@ -13,12 +14,14 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
     private readonly string? _ignoredMachineName;
     internal MatchedServicesMonitor(IMdnsServiceSearchProfile searchProfile, string thisMachineName)
     {
+#if WPF
         MatchedServiceSelectedCommand = new(contextAndService => {
             if (contextAndService?.Length > 1 && contextAndService[1] is IMdnsMatchedService service)
             {
                 ServiceWasSelected?.Invoke(contextAndService[0], service);
             }
         });
+#endif
         SearchProfile = searchProfile;
         if (!searchProfile.AllowLocalhost)
         {
@@ -36,7 +39,9 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
         set => _ = SetProperty(ref _services, value);
     }
 
+#if WPF
     public RelayCommand<object[]> MatchedServiceSelectedCommand { get; }
+#endif
 
     internal void Discovered(ServiceInstanceDiscoveryEventArgs args)
     {
@@ -55,7 +60,7 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
         }
     }
 
-    private static MessageRecords MessageToRecords(Message message)
+    private static MessageRecords MessageToRecords(Makaretu.Dns.Message message)
     {
         SRVRecord? srv = (SRVRecord?)message.Answers.FirstOrDefault(r => r is SRVRecord) ?? 
                          (SRVRecord?)message.AdditionalRecords.FirstOrDefault(r => r is SRVRecord);

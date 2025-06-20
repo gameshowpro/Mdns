@@ -13,10 +13,6 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-    strategy:
-      matrix:
-        ChannelName:
-        - Release
 
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
@@ -26,7 +22,18 @@ jobs:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
       SLN_PATH: .\src\GameshowPro.Mdns\GameshowPro.Mdns.csproj
       PUBLISH_PATH: .\publish
-      PACKAGE_GLOB: ./publish/*.nupkg
+      
+    strategy:
+      matrix:
+        package:
+          - name: Cross-platform
+            configuration: Release
+          - name: Windows
+            configuration: ReleaseWindows
+     
+    outputs:
+      semver2_version: ${{ env.NBGV_SemVer2 }}      
+      nuget_version: ${{ env.NBGV_NuGetPackageVersion }}
 
     steps:
     - uses: actions/checkout@v4
@@ -48,27 +55,65 @@ jobs:
       run: dotnet nuget add source --username ${{ vars.GSP_PACKAGE_USERNAME }} --password ${{ secrets.GSP_PACKAGE_PAT }} --store-password-in-clear-text --name github ${{ vars.NUGET_URL }}
 
     - name: Run tests
-      run: dotnet test $env:SLN_PATH -c Release
+      run: dotnet test $env:SLN_PATH -c ${{ matrix.package.configuration }}
 
-    - name: Build release packages
+    - name: Build and pack
+      id: pack
       run: |
-        dotnet pack $env:SLN_PATH --output $env:PUBLISH_PATH -c Release
+        dotnet pack $env:SLN_PATH --output ${{env.PUBLISH_PATH}} -c ${{ matrix.package.configuration }}
 
-    - name: Publish NuGet package
-      run: |
-        foreach($file in (Get-ChildItem "${{ env.PUBLISH_PATH }}" -Recurse -Include *.nupkg)) {
-            dotnet nuget push $file --api-key "${{ secrets.GSP_PACKAGE_PAT }}" --source https://nuget.pkg.github.com/gameshowpro/index.json --skip-duplicate
-        }
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: package-${{ matrix.package.name }}
+        path: |
+          ${{ env.PUBLISH_PATH }}/*.nupkg
+          ${{ env.PUBLISH_PATH }}/*.snupkg
 
+  Release_And_Push:
+    name: Release and push packages
+    needs: Build_And_Package
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # For tag creation
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./all-packages
+    
+    - name: Nerdbank.GitVersioning
+      uses: dotnet/nbgv@v0.4.1
+      with:
+        setAllVars: true
+    
     - name: Add tags
-      id: addTags
       shell: pwsh
       run: |
-        nbgv tag 
-        git push origin "v$env:NBGV_NuGetPackageVersion"
-
-    - name: Release
+        nbgv tag ${{ needs.Build_And_Package.outputs.semver2_version }}
+        git push origin "v${{ needs.Build_And_Package.outputs.semver2_version }}"
+    
+    - name: Create GitHub release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: v${{ env.NBGV_NuGetPackageVersion }}
-        files: ${{ env.PACKAGE_GLOB }}
+        tag_name: v${{ needs.Build_And_Package.outputs.semver2_version }}
+        files: |
+          ./all-packages/**/*.nupkg
+          ./all-packages/**/*.snupkg
+
+    - name: Publish NuGet packages
+      run: |
+        $packages = Get-ChildItem -Path "./all-packages" -Recurse -Filter "*.nupkg"
+        foreach ($package in $packages) {
+          Write-Host "Pushing package: $package.FullName"
+          dotnet nuget push $package.FullName --api-key "${{ secrets.GSP_PACKAGE_PAT }}" --source ${{ vars.NUGET_URL }} --skip-duplicate
+          if (-not $?) {
+            Write-Error "Failed to push package: $($package.Name)"
+            exit 1
+          }
+        }

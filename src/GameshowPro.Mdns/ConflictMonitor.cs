@@ -14,7 +14,11 @@ public class ConflictMonitor : ObservableClass
     public ServiceFinder ServiceFinder { get; }
     public IMdnsMatchedServicesMonitor ConflictingServices { get; }
 
-    public ConflictMonitor(IMdnsInstanceProperties instanceProperties, IEnumerable<IMdnsServiceSearchProfile> otherServices, ILogger logger, CancellationToken cancellationToken)
+    public ConflictMonitor(IMdnsInstanceProperties instanceProperties, 
+        IEnumerable<IMdnsServiceSearchProfile> otherServices,
+        ILogger logger, 
+        CancellationToken cancellationToken
+    )
     {
         string thisMachineName = Environment.MachineName;
         _advertisedService = new(instanceProperties, thisMachineName, logger);
