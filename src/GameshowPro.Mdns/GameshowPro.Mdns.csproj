@@ -42,18 +42,53 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
 	</ItemGroup>
-  <Choose>
-    <When Condition="Exists('$(GP_COMMON)')">
-      <ItemGroup>
-        <ProjectReference Include="$(GP_COMMON)GameshowPro.Common\GameshowPro.Common.csproj" />
-        <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
-      </ItemGroup>
+    <Choose>
+    <When Condition="'$(Configuration)' == 'DebugWindows' OR '$(Configuration)' == 'ReleaseWindows'">
+      <PropertyGroup>
+        <TargetFrameworks>net8.0-windows;net9.0-windows</TargetFrameworks>
+        <UseWPF>true</UseWPF>
+        <EnableWindowsTargeting>true</EnableWindowsTargeting>
+        <DefineConstants>$(DefineConstants);WPF</DefineConstants>
+        <PackageId>GameshowPro.Mdns.Windows</PackageId>
+      </PropertyGroup>
+      <Choose>
+        <When Condition="Exists('$(GP_COMMON)')">
+          <ItemGroup>
+            <ProjectReference Include="$(GP_COMMON)GameshowPro.Common\GameshowPro.Common.csproj" />
+            <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
+          </ItemGroup>
+        </When>
+        <Otherwise>
+          <ItemGroup>
+            <PackageReference Include="GameshowPro.Common.Windows" Version="1.1.50" />
+            <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
+          </ItemGroup>
+        </Otherwise>
+      </Choose>
     </When>
     <Otherwise>
+      <PropertyGroup>
+        <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+        <PackageId>GameshowPro.Mdns</PackageId>
+      </PropertyGroup>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common" Version="1.1.47" />
-        <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
+        <None Include="**\*.xaml" />
+        <Compile Remove="**\*.xaml.cs" />
       </ItemGroup>
+      <Choose>
+        <When Condition="Exists('$(GP_COMMON)')">
+          <ItemGroup>
+            <ProjectReference Include="$(GP_COMMON)GameshowPro.Common\GameshowPro.Common.csproj" />
+            <ProjectReference Include="..\..\..\net-mdns\src\Mdns.csproj" />
+          </ItemGroup>
+        </When>
+        <Otherwise>
+          <ItemGroup>
+            <PackageReference Include="GameshowPro.Common" Version="1.1.50" />
+            <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
+          </ItemGroup>
+        </Otherwise>
+      </Choose>
     </Otherwise>
   </Choose>
 </Project>
