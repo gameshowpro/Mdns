@@ -10,7 +10,7 @@ jobs:
 
   Build_And_Package:
     name: Build and package
-    runs-on: windows-latest
+    runs-on: unbuntu-latest
     permissions:
       contents: write
 
@@ -20,8 +20,8 @@ jobs:
       DOTNET_NOLOGO: true
       BuildConfiguration: Release
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-      SLN_PATH: .\src\GameshowPro.Mdns\GameshowPro.Mdns.csproj
-      PUBLISH_PATH: .\publish
+      SLN_PATH: ./src/GameshowPro.Mdns/GameshowPro.Mdns.csproj
+      PUBLISH_PATH: ./publish
       
     strategy:
       matrix:
@@ -52,12 +52,15 @@ jobs:
         setAllVars: true
 
     - name: Add nuget source
+      shell: pwsh
       run: dotnet nuget add source --username ${{ vars.GSP_PACKAGE_USERNAME }} --password ${{ secrets.GSP_PACKAGE_PAT }} --store-password-in-clear-text --name github ${{ vars.NUGET_URL }}
 
     - name: Run tests
+      shell: pwsh
       run: dotnet test $env:SLN_PATH -c ${{ matrix.package.configuration }}
 
     - name: Build and pack
+      shell: pwsh
       id: pack
       run: |
         dotnet pack $env:SLN_PATH --output ${{env.PUBLISH_PATH}} -c ${{ matrix.package.configuration }}
@@ -73,7 +76,7 @@ jobs:
   Release_And_Push:
     name: Release and push packages
     needs: Build_And_Package
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     
@@ -107,6 +110,7 @@ jobs:
           ./all-packages/**/*.snupkg
 
     - name: Publish NuGet packages
+      shell: pwsh
       run: |
         $packages = Get-ChildItem -Path "./all-packages" -Recurse -Filter "*.nupkg"
         foreach ($package in $packages) {
