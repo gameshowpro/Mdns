@@ -10,7 +10,7 @@ jobs:
 
   Build_And_Package:
     name: Build and package
-    runs-on: unbuntu-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
