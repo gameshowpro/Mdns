@@ -49,7 +49,7 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
 
         if (records.Srv != null  && (_ignoredMachineName == null || !records.Srv.Target.Labels[0].Equals(_ignoredMachineName, StringComparison.InvariantCultureIgnoreCase)) && records.A.Length > 0)
         {
-            FoundHost foundHost = _foundHosts.GetOrAdd(records.Srv.CanonicalName, (a) => new FoundHost(records.Srv.Name.Labels[0], records.Srv.Port, new ConcurrentDictionary<IPAddress, Stopwatch>()));
+            FoundHost foundHost = _foundHosts.GetOrAdd(records.Srv.CanonicalName, (a) => new FoundHost(LabelsToMdnsHostName(records.Srv.Target.Labels), records.Srv.Port, new ConcurrentDictionary<IPAddress, Stopwatch>()));
             foreach (ARecord a in records.A)
             {
                 foundHost.Addresses.AddOrUpdate(a.Address, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
@@ -57,6 +57,23 @@ public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonit
 
             }
             UpdateConflictingServices();
+        }
+    }
+
+    private static string LabelsToMdnsHostName(IReadOnlyList<string> labels)
+    {
+        switch (labels.Count)
+        {
+            case 0:
+                return "";
+            case 1:
+                return labels[0];
+            default:
+                if (labels[labels.Count - 1] == "local")
+                {
+                    return labels[0] + ".local";
+                }
+                return labels[0];
         }
     }
 
