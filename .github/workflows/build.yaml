@@ -72,6 +72,7 @@ jobs:
         path: |
           ${{ env.PUBLISH_PATH }}/*.nupkg
           ${{ env.PUBLISH_PATH }}/*.snupkg
+        retention-days: 3
 
   Release_And_Push:
     name: Release and push packages
