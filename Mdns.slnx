@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GameshowPro.Mdns/GameshowPro.Mdns.csproj" />
+  </Folder>
+</Solution>

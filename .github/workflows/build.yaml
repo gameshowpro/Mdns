@@ -40,10 +40,10 @@ jobs:
       with:
         fetch-depth: 0 # avoid shallow clone so nbgv can do its work.
 
-    - name: Use .NET 9.0.x
+    - name: Use .NET 10.0.x
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '9.0.x'
+        dotnet-version: '10.0.x'
         dotnet-quality: 'ga'
 
     - name: Nerdbank.GitVersioning

@@ -25,7 +25,7 @@
     <Product>GameshowPro mDNS wrapper</Product>
     <Description>A wrapper around a lower level mDNS implemenation to allow easy and consistent implementation within GameShowPro applications.</Description>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
-    <Copyright>© 2025 Barjonas LLC</Copyright>
+    <Copyright>Barjonas LLC 2026</Copyright>
     <PackageTags>multicast mdns dns zeroconf</PackageTags>
     <IncludeSymbols>True</IncludeSymbols>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
