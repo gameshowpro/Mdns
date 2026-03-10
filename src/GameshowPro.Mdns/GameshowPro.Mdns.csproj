@@ -59,7 +59,7 @@
         </When>
         <Otherwise>
           <ItemGroup>
-            <PackageReference Include="GameshowPro.Common.Windows" Version="1.1.50" />
+            <PackageReference Include="GameshowPro.Common.Windows" Version="1.1.73" />
             <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
           </ItemGroup>
         </Otherwise>
@@ -83,7 +83,7 @@
         </When>
         <Otherwise>
           <ItemGroup>
-            <PackageReference Include="GameshowPro.Common" Version="1.1.66" />
+            <PackageReference Include="GameshowPro.Common" Version="1.1.73" />
             <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
           </ItemGroup>
         </Otherwise>
