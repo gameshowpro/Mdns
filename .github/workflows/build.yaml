@@ -36,18 +36,18 @@ jobs:
       nuget_version: ${{ env.NBGV_NuGetPackageVersion }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         fetch-depth: 0 # avoid shallow clone so nbgv can do its work.
 
     - name: Use .NET 10.0.x
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '10.0.x'
         dotnet-quality: 'ga'
 
     - name: Nerdbank.GitVersioning
-      uses: dotnet/nbgv@v0.4.1
+      uses: dotnet/nbgv@v0.5.2
       with:
         setAllVars: true
 
@@ -66,7 +66,7 @@ jobs:
         dotnet pack $env:SLN_PATH --output ${{env.PUBLISH_PATH}} -c ${{ matrix.package.configuration }}
 
     - name: Upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: package-${{ matrix.package.name }}
         path: |
@@ -82,17 +82,17 @@ jobs:
       contents: write
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         fetch-depth: 0 # For tag creation
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: ./all-packages
     
     - name: Nerdbank.GitVersioning
-      uses: dotnet/nbgv@v0.4.1
+      uses: dotnet/nbgv@v0.5.2
       with:
         setAllVars: true
     
@@ -103,7 +103,7 @@ jobs:
         git push origin "v${{ needs.Build_And_Package.outputs.semver2_version }}"
     
     - name: Create GitHub release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         tag_name: v${{ needs.Build_And_Package.outputs.semver2_version }}
         files: |
