@@ -3,6 +3,7 @@
     <When Condition="'$(Configuration)' == 'ReleaseWindows' OR '$(Configuration)' == 'DebugWindows'">
       <PropertyGroup>
         <TargetFrameworks>net10.0-windows</TargetFrameworks>
+        <EnableWindowsTargeting>true</EnableWindowsTargeting>
         <DefineConstants>$(DefineConstants);WPF</DefineConstants>
         <Title>GameshowPro mDNS wrapper - Windows version</Title>
         <UseWpf>true</UseWpf>
@@ -10,7 +11,7 @@
         <PackageId>GameshowPro.Mdns.Windows</PackageId>
       </PropertyGroup>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common.Windows" Version="1.3.7" />
+        <PackageReference Include="GameshowPro.Common.Windows" Version="1.4.10" />
       </ItemGroup>
     </When>
     <Otherwise>
@@ -24,7 +25,7 @@
         <Compile Remove="**\*.xaml.cs" />
       </ItemGroup>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common" Version="1.3.7" />
+        <PackageReference Include="GameshowPro.Common" Version="1.4.10" />
       </ItemGroup>
     </Otherwise>
   </Choose>
@@ -47,10 +48,10 @@
     <None Include="..\..\readme.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 	<ItemGroup>
-    <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.91">
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.6" />
+    <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.9" />
 	</ItemGroup>
 </Project>
