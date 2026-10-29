@@ -1,0 +1,15 @@
+<Project>
+  <!-- Match Soundling's JSON dependency policy in local and CI builds. -->
+  <Target Name="ForbidNewtonsoftJson" AfterTargets="ResolvePackageAssets"
+          Condition="'$(DisableNewtonsoftJsonGuard)' != 'true'">
+    <Error Condition="'%(PackageDependencies.Identity)' == 'Newtonsoft.Json'"
+           Text="Newtonsoft.Json is banned in GameshowPro.Mdns. Use GameshowPro.Common's System.Text.Json support; trace the dependency with 'dotnet list package --include-transitive'." />
+  </Target>
+  <ItemGroup Condition="!$(MSBuildProjectName.EndsWith('.Tests'))">
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <AdditionalFiles Include="$(MSBuildThisFileDirectory)BannedSymbols.txt" />
+  </ItemGroup>
+</Project>

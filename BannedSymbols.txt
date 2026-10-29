@@ -1,0 +1,4 @@
+T:System.Text.Json.JsonSerializer;All JSON goes through GameshowPro.Common (SettingsFileManager, SystemTextJsonUtils) so it uses the Common STJ options (docs/coding-standards.md)
+M:System.Text.Json.JsonSerializerOptions.#ctor;Use the GameshowPro.Common STJ options instead of building new ones (docs/coding-standards.md)
+M:System.Text.Json.JsonSerializerOptions.#ctor(System.Text.Json.JsonSerializerDefaults);Use the GameshowPro.Common STJ options instead of building new ones (docs/coding-standards.md)
+M:System.Text.Json.JsonSerializerOptions.#ctor(System.Text.Json.JsonSerializerOptions);Use the GameshowPro.Common STJ options instead of building new ones (docs/coding-standards.md)
