@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/GameshowPro.Mdns/GameshowPro.Mdns.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GameshowPro.Mdns.Tests/GameshowPro.Mdns.Tests.csproj" />
+  </Folder>
 </Solution>

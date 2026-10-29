@@ -1,163 +1,227 @@
-﻿#if WPF
-using GameshowPro.Common.ViewModel;
-#endif
 namespace GameshowPro.Mdns;
 
 public class MatchedServicesMonitor : ObservableClass, IMdnsMatchedServicesMonitor
 {
-    private record FoundHost(string HostName, int Port, ConcurrentDictionary<IPAddress, Stopwatch> Addresses);
-    private record MessageRecords(SRVRecord? Srv, ImmutableArray<ARecord> A);
-    public event Action<object, IMdnsMatchedService>? ServiceWasSelected;
-    private static readonly string s_machineNamePrefix = TxtRecordMachineName + "=";
-    private readonly ConcurrentDictionary<string, FoundHost> _foundHosts = [];
-    private readonly ConcurrentDictionary<IPAddress, string> _foundAddresses = [];
+    private sealed record CachedRecord(int InterfaceIndex, DnsRecord Record,
+        DateTimeOffset Received, DateTimeOffset Expires);
+    // TTL refresh and goodbye processing update entries in place under _sync.
+    private readonly List<CachedRecord> _records = [];
+    private readonly object _sync = new();
+    private readonly TimeProvider _clock;
     private readonly string? _ignoredMachineName;
-    internal MatchedServicesMonitor(IMdnsServiceSearchProfile searchProfile, string thisMachineName)
+    private ImmutableArray<IMdnsMatchedService> _services = [];
+
+    internal MatchedServicesMonitor(IMdnsServiceSearchProfile profile, string thisMachineName,
+        TimeProvider? clock = null)
     {
+        SearchProfile = profile;
+        _clock = clock ?? TimeProvider.System;
+        if (!profile.AllowLocalhost)
+        {
+            _ignoredMachineName = thisMachineName;
+        }
 #if WPF
-        MatchedServiceSelectedCommand = new(contextAndService => {
+        MatchedServiceSelectedCommand = new(Select);
+
+        void Select(object[]? contextAndService)
+        {
             if (contextAndService?.Length > 1 && contextAndService[1] is IMdnsMatchedService service)
             {
                 ServiceWasSelected?.Invoke(contextAndService[0], service);
             }
-        });
-#endif
-        SearchProfile = searchProfile;
-        if (!searchProfile.AllowLocalhost)
-        {
-            _ignoredMachineName = thisMachineName;
         }
+#endif
     }
-    public IMdnsServiceSearchProfile SearchProfile { get; }
-    internal static string GetKey(string serviceType, string protocol) => serviceType + "._" + protocol.ToLowerInvariant();
-    internal static string GetKey(ServiceSearchProfile searchProfile) => GetKey(searchProfile.ServiceType, searchProfile.Protocol);
 
-    private ImmutableArray<IMdnsMatchedService> _services = [];
+    // Non-WPF builds retain the interface event; only the WPF command raises it.
+#pragma warning disable CS0067
+    public event Action<object, IMdnsMatchedService>? ServiceWasSelected;
+#pragma warning restore CS0067
+    public IMdnsServiceSearchProfile SearchProfile { get; }
     public ImmutableArray<IMdnsMatchedService> Services
     {
         get => _services;
         set => _ = SetProperty(ref _services, value);
     }
-
 #if WPF
     public RelayCommand<object[]> MatchedServiceSelectedCommand { get; }
 #endif
 
-    internal void Discovered(ServiceInstanceDiscoveryEventArgs args)
-    {
-        MessageRecords records = MessageToRecords(args.Message);
+    internal static string GetKey(string serviceType, string protocol) =>
+        serviceType + "._" + protocol.ToLowerInvariant();
 
-        if (records.Srv != null  && (_ignoredMachineName == null || !records.Srv.Target.Labels[0].Equals(_ignoredMachineName, StringComparison.InvariantCultureIgnoreCase)) && records.A.Length > 0)
+    internal void Receive(MdnsPacket packet)
+    {
+        lock (_sync)
         {
-            FoundHost foundHost = _foundHosts.GetOrAdd(records.Srv.CanonicalName, (a) => new FoundHost(LabelsToMdnsHostName(records.Srv.Target.Labels), records.Srv.Port, new ConcurrentDictionary<IPAddress, Stopwatch>()));
-            foreach (ARecord a in records.A)
+            DateTimeOffset now = _clock.GetUtcNow();
+            _ = _records.RemoveAll(entry => entry.Expires <= now);
+            DnsRecord[] incoming = [.. packet.Message.Answers, .. packet.Message.Authorities,
+                .. packet.Message.Additionals];
+            incoming = [.. incoming.Where(r => r.BaseClass == 1 &&
+                r.Type is DnsTypes.Ptr or DnsTypes.Srv or DnsTypes.Txt or DnsTypes.A or DnsTypes.Aaaa)];
+            // A cache-flush packet can contain several addresses for the same host.
+            foreach (IGrouping<(string Name, ushort Type, ushort BaseClass), DnsRecord> group in incoming.Where(r => r.CacheFlush && r.Ttl > 0)
+                         .GroupBy(r => (Name: DnsNames.Canonical(r.Name).ToUpperInvariant(), r.Type, r.BaseClass)))
             {
-                foundHost.Addresses.AddOrUpdate(a.Address, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
-                _foundAddresses.AddOrUpdate(a.Address, records.Srv.CanonicalName, (address, old) => records.Srv.CanonicalName);
-
-            }
-            UpdateConflictingServices();
-        }
-    }
-
-    private static string LabelsToMdnsHostName(IReadOnlyList<string> labels)
-    {
-        switch (labels.Count)
-        {
-            case 0:
-                return "";
-            case 1:
-                return labels[0];
-            default:
-                if (labels[labels.Count - 1] == "local")
+                for (int i = 0; i < _records.Count; i++)
                 {
-                    return labels[0] + ".local";
-                }
-                return labels[0];
-        }
-    }
-
-    private static MessageRecords MessageToRecords(Makaretu.Dns.Message message)
-    {
-        SRVRecord? srv = (SRVRecord?)message.Answers.FirstOrDefault(r => r is SRVRecord) ?? 
-                         (SRVRecord?)message.AdditionalRecords.FirstOrDefault(r => r is SRVRecord);
-        
-        ImmutableArray<ARecord> aRecords = [
-            .. message.Answers.Where(r => r is ARecord).Select(r => (ARecord)r),
-            .. message.AdditionalRecords.Where(r => r is ARecord).Select(r => (ARecord)r)
-        ];
-        
-        return new MessageRecords(srv, aRecords);
-    }
-
-    internal void Shutdown(ServiceInstanceShutdownEventArgs args)
-    {
-        MessageRecords records = MessageToRecords(args.Message);
-        foreach (ARecord a in records.A)
-        {
-            if (_foundAddresses.TryRemove(a.Address, out string? serviceInstanceName))
-            {
-                if (_foundHosts.TryRemove(serviceInstanceName, out _)) // Remove all records with this host name, because we might not get message for every individual address
-                {
-                    UpdateConflictingServices();
+                    CachedRecord old = _records[i];
+                    if (old.InterfaceIndex == packet.InterfaceIndex &&
+                        old.Record.Type == group.Key.Type && old.Record.BaseClass == group.Key.BaseClass &&
+                        DnsNames.Equals(old.Record.Name, group.Key.Name) &&
+                        !group.Any(record => DnsRecords.Equivalent(old.Record, record)) &&
+                        now - old.Received >= TimeSpan.FromSeconds(1))
+                    {
+                        _records[i] = old with { Expires = now.AddSeconds(1) };
+                    }
                 }
             }
+
+            foreach (DnsRecord record in incoming)
+            {
+                if (record.Ttl == 0)
+                {
+                    for (int i = 0; i < _records.Count; i++)
+                    {
+                        CachedRecord old = _records[i];
+                        if (old.InterfaceIndex == packet.InterfaceIndex &&
+                            DnsRecords.Equivalent(old.Record, record))
+                        {
+                            _records[i] = old with { Expires =
+                                Min(old.Expires, now.AddSeconds(1)) };
+                        }
+                    }
+                    continue;
+                }
+                _ = _records.RemoveAll(e => e.InterfaceIndex == packet.InterfaceIndex &&
+                    DnsRecords.Equivalent(e.Record, record));
+                _records.Add(new(packet.InterfaceIndex, record, now,
+                    now.AddSeconds(Math.Min(record.Ttl, 86400u))));
+            }
+            if (_records.Count > 4096)
+            {
+                _records.RemoveRange(0, _records.Count - 4096);
+            }
+
+            Rebuild();
         }
-            
     }
 
-    internal void AnswerReceived(MessageEventArgs args)
-    {
-        MessageRecords records = MessageToRecords(args.Message);
-        foreach (ARecord a in records.A)
-        {
-            if (_foundAddresses.TryGetValue(a.Address, out string? serviceInstanceName))
-            {
-                if (_foundHosts.TryGetValue(serviceInstanceName, out FoundHost? foundHost))
-                {
-                    foundHost.Addresses.AddOrUpdate(a.Address, Stopwatch.StartNew(), (address, sw) => { sw.Restart(); return sw; });
-                }
-            }
-        }
-    }
+    private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
 
     internal void TrimExpiredServices()
     {
-        bool change = false;
-        try
+        lock (_sync)
         {
-            foreach (KeyValuePair<string, FoundHost> foundHostPair in _foundHosts)
+            if (_records.RemoveAll(e => e.Expires <= _clock.GetUtcNow()) > 0)
             {
-                ImmutableArray<IPAddress> expiredAddresses = [.. foundHostPair.Value.Addresses.Where(a => a.Value.Elapsed > TimeSpan.FromSeconds(15)).Select(a => a.Key)];
-                expiredAddresses.ForEach(expired =>
-                {
-                    foundHostPair.Value.Addresses.TryRemove(expired, out _);
-                    _foundAddresses.TryRemove(expired, out _);
-                });
-                change = expiredAddresses.Length > 0;
+                Rebuild();
             }
-            ImmutableArray<string> expiredHosts = [.. _foundHosts.Where(ha => ha.Value.Addresses.IsEmpty).Select(ha => ha.Key)];
-            expiredHosts.ForEach(expired =>
-            {
-                _foundHosts.TryRemove(expired, out _);
-            });
-            change = change || expiredHosts.Length > 0;
-        }
-        catch { }
-        if (change)
-        {
-            UpdateConflictingServices();
         }
     }
 
-    void UpdateConflictingServices()
+    private void Rebuild()
     {
-        Services = [.. _foundHosts
-                .OrderBy(ha => ha.Key)
-                .Select(ha => new MdnsMatchedService(this, ha.Value.HostName, ha.Value.Port, [.. ha.Value.Addresses.Select((a, s) => a.Key)]))
-        ];
+        string serviceName = DnsNames.Canonical(GetKey(SearchProfile.ServiceType,
+            SearchProfile.Protocol) + ".local");
+        Dictionary<string, (string HostName, int Port, HashSet<IPAddress> Addresses)> matches = new(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (IGrouping<int, CachedRecord> interfaceRecords in _records.GroupBy(e => e.InterfaceIndex))
+        {
+            DnsRecord[] records = [.. interfaceRecords.Select(e => e.Record)];
+            foreach (DnsRecord ptr in records.Where(r => r.Type == DnsTypes.Ptr &&
+                         DnsNames.Equals(r.Name, serviceName) && r.Data is NameData))
+            {
+                string instance = ((NameData)ptr.Data).Name;
+                DnsRecord? srvRecord = records.LastOrDefault(r => r.Type == DnsTypes.Srv &&
+                    DnsNames.Equals(r.Name, instance) && r.Data is SrvData);
+                if (srvRecord?.Data is not SrvData srv)
+                {
+                    continue;
+                }
+
+                DnsRecord? txtRecord = records.LastOrDefault(r => r.Type == DnsTypes.Txt &&
+                    DnsNames.Equals(r.Name, instance) && r.Data is TxtData);
+                string? machineName = txtRecord?.Data is TxtData txt ? MachineName(txt) : null;
+                IReadOnlyList<string> hostLabels = DnsNames.Labels(srv.Target);
+                if (_ignoredMachineName is not null &&
+                    string.Equals(machineName ?? (hostLabels.Count > 0 ? hostLabels[0] : null), _ignoredMachineName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                ImmutableArray<IPAddress> addresses = [.. records.Where(r =>
+                        (r.Type == DnsTypes.A || r.Type == DnsTypes.Aaaa) &&
+                        DnsNames.Equals(r.Name, srv.Target) && r.Data is AddressData)
+                    .Select(r => ScopeAddress(((AddressData)r.Data).Address,
+                        interfaceRecords.Key)).Distinct()];
+                if (addresses.Length == 0)
+                {
+                    continue;
+                }
+
+                string key = DnsNames.Canonical(instance) + "|" + srv.Port;
+                if (!matches.TryGetValue(key, out (string HostName, int Port, HashSet<IPAddress> Addresses) match))
+                {
+                    match = (DisplayHost(srv.Target, machineName), srv.Port, []);
+                    matches.Add(key, match);
+                }
+                foreach (IPAddress address in addresses)
+                {
+                    _ = match.Addresses.Add(address);
+                }
+            }
+        }
+        Services = [.. matches.Values.OrderBy(m => m.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(m => m.Port).Select(m => (IMdnsMatchedService)new MdnsMatchedService(this,
+                m.HostName, m.Port, [.. m.Addresses]))];
     }
 
-    static string? GetMachineNameFromRecords(List<ResourceRecord> records)
-        => records.SelectMany(a => a is TXTRecord txt ? txt.Strings : []).Where(s => s.StartsWith(s_machineNamePrefix)).FirstOrDefault()?[s_machineNamePrefix.Length..];
+    private static IPAddress ScopeAddress(IPAddress address, int interfaceIndex) =>
+        address.IsIPv6LinkLocal && address.ScopeId == 0 && interfaceIndex > 0
+            ? new IPAddress(address.GetAddressBytes(), interfaceIndex) : address;
+
+    private static string? MachineName(TxtData txt)
+    {
+        foreach (byte[] raw in txt.Strings)
+        {
+            string value = Encoding.UTF8.GetString(raw);
+            const string Prefix = "machineName=";
+            if (value.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return value[Prefix.Length..];
+            }
+        }
+        return null;
+    }
+
+    private static string DisplayHost(string target, string? machineName)
+    {
+        IReadOnlyList<string> labels = DnsNames.Labels(target);
+        if (labels.Count == 0)
+        {
+            return target;
+        }
+
+        if (machineName is not null &&
+            labels[0].Equals(machineName, StringComparison.OrdinalIgnoreCase))
+        {
+            return machineName + ".local";
+        }
+
+        if (machineName is null && labels.Count > 1 &&
+            labels[^1].Equals("local", StringComparison.OrdinalIgnoreCase))
+        {
+            return labels[0] + ".local";
+        }
+
+        if (labels.Count == 2 && labels[1].Equals("local", StringComparison.OrdinalIgnoreCase))
+        {
+            return labels[0] + ".local";
+        }
+
+        return target.TrimEnd('.');
+    }
 }

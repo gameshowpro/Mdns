@@ -1,60 +1,145 @@
-﻿namespace GameshowPro.Mdns;
+namespace GameshowPro.Mdns;
 
-/// <summary>
-/// Allows services to advertise the availability of a service they to clients.
-/// </summary>
-public class AdvertisedService
+/// <summary>Publishes a DNS-SD service on all local interfaces or one selected interface.</summary>
+public class AdvertisedService : IAsyncDisposable
 {
+    private readonly IMdnsInstanceProperties _properties;
+    private readonly AdvertisedServiceOptions _options;
     private readonly ILogger _logger;
-    private readonly IMdnsInstanceProperties _instanceProperties;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private MdnsRegistration? _registration;
+    private volatile bool _disposed;
+    private string? _failure;
 
-    /// <summary>
-    /// Create a new advertised service. Start by calling <see cref="AdvertiseUntilCancelled(CancellationToken)"/>.
-    /// </summary>
-    public AdvertisedService(IMdnsInstanceProperties instanceProperties, ILogger logger) : this(instanceProperties, Environment.MachineName, logger)
+    public AdvertisedService(IMdnsInstanceProperties instanceProperties, ILogger logger)
+        : this(instanceProperties, new AdvertisedServiceOptions(), logger) { }
+
+    public AdvertisedService(IMdnsInstanceProperties instanceProperties, AdvertisedServiceOptions options, ILogger logger)
     {
+        _properties = instanceProperties ?? throw new ArgumentNullException(nameof(instanceProperties));
+        ArgumentNullException.ThrowIfNull(options);
+        _options = new AdvertisedServiceOptions
+        {
+            InstanceName = options.InstanceName,
+            NetworkInterfaceId = options.NetworkInterfaceId,
+            LocalAddress = options.LocalAddress,
+            TxtProperties = options.TxtProperties?.ToFrozenDictionary(pair => pair.Key, pair => pair.Value,
+                StringComparer.OrdinalIgnoreCase),
+        };
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        if ((_options.NetworkInterfaceId is null) != (_options.LocalAddress is null))
+        {
+            throw new ArgumentException("NetworkInterfaceId and LocalAddress must be supplied together.", nameof(options));
+        }
+
+        if (_options.NetworkInterfaceId is { Length: 0 })
+        {
+            throw new ArgumentException("NetworkInterfaceId cannot be empty.", nameof(options));
+        }
+
+        if (_options.InstanceName is { Length: 0 })
+        {
+            throw new ArgumentException("InstanceName cannot be empty.", nameof(options));
+        }
+
+        if (_options.LocalAddress is { AddressFamily: not (System.Net.Sockets.AddressFamily.InterNetwork or System.Net.Sockets.AddressFamily.InterNetworkV6) })
+        {
+            throw new ArgumentException("LocalAddress must be IPv4 or IPv6.", nameof(options));
+        }
     }
 
-    /// <summary>
-    /// Common overload used when thread to launch is created in this class or elsewhere.
-    /// </summary>
-    internal AdvertisedService(IMdnsInstanceProperties instanceProperties, string thisMachineName, ILogger logger)
-    {
-        _instanceProperties = instanceProperties;
-        _logger = logger;
-        ThisMachineName = thisMachineName;
-        Profile = new(ThisMachineName, _instanceProperties.ServiceType + "._" + _instanceProperties.Protocol, _instanceProperties.Port);
-        Profile.AddProperty(TxtRecordMachineName, ThisMachineName);
-    }
+    public string? Failure => _registration?.Failure ?? Volatile.Read(ref _failure);
 
-    /// <summary>
-    /// Returns a task that advertises the service until the cancellation token is cancelled.
-    /// </summary>
-    // Used only when this class is publicly instantiated, so this class is managing the discovery lifecycle.
-    public async Task AdvertiseUntilCancelled(CancellationToken cancellationToken)
+    /// <summary>Starts publication; repeated calls while active share the same registration.</summary>
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        ServiceDiscovery serviceDiscovery = new();
-        await AdvertiseUntilCancelled(serviceDiscovery, cancellationToken);
-        serviceDiscovery.Dispose();
-    }
-
-    internal async Task AdvertiseUntilCancelled(IServiceDiscovery serviceDiscovery, CancellationToken cancellationToken)
-    {
-        serviceDiscovery.Advertise(Profile);
-        serviceDiscovery.Announce(Profile);
-        _logger.LogInformation("Advertising and announcing mdns service type {_instanceProperties.ServiceType}", _instanceProperties.ServiceType);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await Task.Delay(Timeout.Infinite, cancellationToken);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_registration is not null)
+            {
+                return;
+            }
+
+            Dictionary<string, string> txt = new(StringComparer.OrdinalIgnoreCase);
+            if (_options.TxtProperties is not null)
+            {
+                foreach (KeyValuePair<string, string> pair in _options.TxtProperties)
+                {
+                    txt.Add(pair.Key, pair.Value);
+                }
+            }
+
+            txt[TxtRecordMachineName] = Environment.MachineName;
+            MdnsPublication publication = new(
+                _options.InstanceName ?? Environment.MachineName,
+                _properties.ServiceType, _properties.Protocol, _properties.Port, txt);
+            try
+            {
+                MdnsRegistration registration = await MdnsRuntime.RegisterAsync(publication,
+                    new MdnsScope(_options.NetworkInterfaceId, _options.LocalAddress), _logger,
+                    cancellationToken).ConfigureAwait(false);
+                if (registration.Failure is { } failure)
+                {
+                    await registration.DisposeAsync().ConfigureAwait(false);
+                    throw new InvalidOperationException(failure);
+                }
+                _registration = registration;
+                Volatile.Write(ref _failure, null);
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref _failure, ex.Message);
+                throw;
+            }
         }
-        catch { }
-        finally
-        {
-            serviceDiscovery.Unadvertise(Profile);
-        }
-        _logger.LogInformation("Stopped advertising and announcing mdns service type {_instanceProperties.ServiceType}", _instanceProperties.ServiceType);
+        finally { _ = _gate.Release(); }
     }
 
-    internal ServiceProfile Profile { get; }
-    internal string ThisMachineName { get; }
+    /// <summary>Publishes until cancellation, then withdraws the registration.</summary>
+    public async Task AdvertiseUntilCancelled(CancellationToken cancellationToken)
+    {
+        await StartAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(500));
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                if (Failure is { } failure)
+                {
+                    throw new InvalidOperationException(failure);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        finally { await DisposeAsync().ConfigureAwait(false); }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        GC.SuppressFinalize(this);
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            if (_registration is not null)
+            {
+                Volatile.Write(ref _failure, _registration.Failure);
+                await _registration.DisposeAsync().ConfigureAwait(false);
+            }
+            _registration = null;
+        }
+        finally { _ = _gate.Release(); }
+    }
 }

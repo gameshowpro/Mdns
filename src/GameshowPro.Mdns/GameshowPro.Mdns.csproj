@@ -32,9 +32,10 @@
   <PropertyGroup>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>14.0</LangVersion>
     <Authors>Hamish Barjonas</Authors>
     <Product>GameshowPro mDNS wrapper</Product>
-    <Description>A wrapper around a lower level mDNS implemenation to allow easy and consistent implementation within GameShowPro applications.</Description>
+    <Description>DNS Service Discovery publication and browsing with a shared, owned mDNS runtime for GameshowPro applications.</Description>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <Copyright>Barjonas LLC 2026</Copyright>
     <PackageTags>multicast mdns dns zeroconf</PackageTags>
@@ -52,6 +53,5 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Makaretu.Dns.Multicast.Gsp" Version="1.0.9" />
 	</ItemGroup>
 </Project>

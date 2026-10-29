@@ -1,129 +1,85 @@
-﻿using Message = Makaretu.Dns.Message;
-
 namespace GameshowPro.Mdns;
 
-/// <summary>
-/// Allows clients to specify a service they require and receive a list of available options.
-/// </summary>
+/// <summary>Discovers requested DNS-SD services and maintains their current addresses.</summary>
 public class ServiceFinder : IMdnsServiceFinder
 {
+    private static readonly Action<ILogger, Exception?> s_responseFailed =
+        LoggerMessage.Define(LogLevel.Warning, new EventId(6101, nameof(Receive)),
+            "Could not process an mDNS response");
+    private static readonly Action<ILogger, Exception?> s_searchStopped =
+        LoggerMessage.Define(LogLevel.Error, new EventId(6102, nameof(SearchUntilCancelled)),
+            "mDNS discovery stopped unexpectedly");
     private readonly ILogger _logger;
-    /// <summary>
-    /// Create a new service finder and begin searching for specified service types immediately.
-    /// </summary>
-    /// <param name="searchProfiles"></param>
-    /// <param name="logger"></param>
-    /// <param name="cancellationToken"></param>
-    public ServiceFinder(IEnumerable<IMdnsServiceSearchProfile> searchProfiles, ILogger logger, CancellationToken cancellationToken) : this(searchProfiles, Environment.MachineName, logger)
-    {
+    public IReadOnlyDictionary<IMdnsServiceSearchProfile, IMdnsMatchedServicesMonitor> Services { get; }
+    internal FrozenDictionary<string, ImmutableArray<MatchedServicesMonitor>> ServicesByName { get; }
 
-        Task.Run(() => SearchUntilCancelled(cancellationToken), cancellationToken);
+    public ServiceFinder(IEnumerable<IMdnsServiceSearchProfile> searchProfiles, ILogger logger,
+        CancellationToken cancellationToken)
+        : this(searchProfiles, Environment.MachineName, logger)
+    {
+        SearchUntilCancelled(cancellationToken).FireAndForgetSafeAsync(
+            ex => s_searchStopped(_logger, ex));
     }
 
-    /// <summary>
-    /// Common overload used both internally and externally. Doesn't start the search.
-    /// </summary>
-    /// <param name="searchProfiles"></param>
-    /// <param name="logger"></param>
-    internal ServiceFinder(IEnumerable<IMdnsServiceSearchProfile> searchProfiles, string thisMachineName, ILogger logger)
+    internal ServiceFinder(IEnumerable<IMdnsServiceSearchProfile> searchProfiles,
+        string thisMachineName, ILogger logger)
     {
-        _logger = logger;
-        Services = searchProfiles.ToFrozenDictionary(t => t, t => (IMdnsMatchedServicesMonitor)new MatchedServicesMonitor(t, thisMachineName));
-        ServicesByName = Services.ToFrozenDictionary(kvp => MatchedServicesMonitor.GetKey((ServiceSearchProfile)kvp.Key), kvp => (MatchedServicesMonitor)kvp.Value);
-    }
-    /// <summary>
-    /// Used only when this class is publicly instantiated, so this class is managing the discovery lifecycle.
-    /// </summary>
-    private async Task SearchUntilCancelled(CancellationToken cancellationToken)
-    {
-        ServiceDiscovery discovery = new();
-        await SearchUntilCancelled(discovery, cancellationToken);
-        discovery.Dispose();
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(searchProfiles);
+        FrozenDictionary<IMdnsServiceSearchProfile, IMdnsMatchedServicesMonitor> services = searchProfiles.ToFrozenDictionary(profile => profile,
+            profile => (IMdnsMatchedServicesMonitor)new MatchedServicesMonitor(profile, thisMachineName));
+        Services = services;
+        ServicesByName = services.Values.Cast<MatchedServicesMonitor>()
+            .GroupBy(m => MatchedServicesMonitor.GetKey(m.SearchProfile.ServiceType,
+                m.SearchProfile.Protocol), StringComparer.OrdinalIgnoreCase)
+            .ToFrozenDictionary(g => g.Key, g => g.ToImmutableArray(),
+                StringComparer.OrdinalIgnoreCase);
     }
 
-    /// <summary>
-    /// Common overload used both internally and externally. ServiceDiscovery is passed in so that the caller can manage the lifecycle.
-    /// </summary>
-    internal async Task SearchUntilCancelled(IServiceDiscovery serviceDiscovery, CancellationToken cancellationToken)
+    internal async Task SearchUntilCancelled(CancellationToken cancellationToken)
     {
-        serviceDiscovery.ServiceInstanceDiscovered += (s, e) =>
+        if (cancellationToken.IsCancellationRequested)
         {
-            if (TryGetServices(LabelsToKey(e.ServiceInstanceName.Labels), out MatchedServicesMonitor? services))
-            {
-                //Beware - this is often fired on many simultaneous threads
-                _logger.LogTrace("ServiceInstanceDiscovered at {address}: {name}", e.RemoteEndPoint.Address, e.ServiceInstanceName.ToCanonical());
+            return;
+        }
 
-                services.Discovered(e);
-            }
-        };
-        serviceDiscovery.ServiceInstanceShutdown += (s, e) =>
+        await using MdnsBrowseSubscription subscription = await MdnsRuntime.BrowseAsync(
+            ServicesByName.Keys.Select(k => k + ".local."), Receive, _logger,
+            cancellationToken).ConfigureAwait(false);
+        if (subscription.Failure is { } failure)
         {
-            if (TryGetServices(LabelsToKey(e.ServiceInstanceName.Labels), out MatchedServicesMonitor? services))
-            {
-                _logger.LogTrace("ServiceInstanceShutdown at endpoint {endpoint}: {name}", e.RemoteEndPoint, e.ServiceInstanceName.ToCanonical());
-                services.Shutdown(e);
-            }
-        };
-        serviceDiscovery.Mdns.AnswerReceived += (s, e) =>
-        {
-            if (TryGetServices(GetServiceType(e.Message), out MatchedServicesMonitor? services))
-            {
-                services.AnswerReceived(e);
-            }
-        };
+            throw new InvalidOperationException(failure);
+        }
 
-        while (!cancellationToken.IsCancellationRequested)
+        using PeriodicTimer timer = new(TimeSpan.FromSeconds(1));
+        try
         {
-            foreach (string serviceTypeAndProtocol in ServicesByName.Keys)
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                serviceDiscovery.QueryServiceInstances(serviceTypeAndProtocol);
-            }
-            ;
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
-                foreach (MatchedServicesMonitor services in ServicesByName.Values)
+                if (subscription.Failure is { } runtimeFailure)
                 {
-                    services.TrimExpiredServices();
+                    throw new InvalidOperationException(runtimeFailure);
+                }
+
+                foreach (MatchedServicesMonitor monitor in ServicesByName.Values.SelectMany(m => m))
+                {
+                    monitor.TrimExpiredServices();
                 }
             }
-            catch
-            {
-            }
         }
-        
-        bool TryGetServices(string? serviceTypeAndProtocol, [NotNullWhen(true)] out MatchedServicesMonitor? services)
-        {
-            if (serviceTypeAndProtocol == null)
-            {
-                services = null;
-                return false;
-            }
-            return ServicesByName.TryGetValue(serviceTypeAndProtocol, out services);
-        }
-
-        string? LabelsToKey(IReadOnlyList<string>? labels)
-        {
-            if (labels?.Count >= 3)
-            {
-                return $"{labels[1]}.{labels[2]}";
-            }
-            return null;
-        }
-
-        string ? GetServiceType(Message message)
-        {
-            string[]? parts = message.Answers.Select(a => a.CanonicalName.Split('.')).FirstOrDefault(n => n.Length >= 3)?.ToArray();
-            if (parts?.Length >= 2)
-            {
-                return $"{parts[0]}.{parts[1]}";
-            }
-            return null;
-        }
-
-
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
     }
 
-    internal FrozenDictionary<string, MatchedServicesMonitor> ServicesByName { get; }
-    public IReadOnlyDictionary<IMdnsServiceSearchProfile, IMdnsMatchedServicesMonitor> Services { get; }
+    private void Receive(MdnsPacket packet)
+    {
+        try
+        {
+            foreach (MatchedServicesMonitor monitor in ServicesByName.Values.SelectMany(m => m))
+            {
+                monitor.Receive(packet);
+            }
+        }
+        catch (Exception ex) { s_responseFailed(_logger, ex); }
+    }
+
 }
