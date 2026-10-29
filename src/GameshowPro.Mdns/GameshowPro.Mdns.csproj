@@ -12,6 +12,10 @@
       </PropertyGroup>
       <ItemGroup>
         <PackageReference Include="GameshowPro.Common.Windows" Version="1.4.10" />
+        <!-- MahApps.Metro 2.4.11 requires ControlzEx below 6.0.0. -->
+        <PackageReference Include="ControlzEx" Version="5.0.2" />
+        <PackageReference Include="Microsoft.Xaml.Behaviors.Wpf" Version="1.1.161" />
+        <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.14" />
       </ItemGroup>
     </When>
     <Otherwise>
