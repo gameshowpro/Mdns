@@ -8,8 +8,38 @@ on:
 
 jobs:
 
+  Test:
+    name: Test (${{ matrix.configuration }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        configuration:
+          - Release
+          - ReleaseWindows
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Use pinned SDK and .NET 10 test runtime
+      uses: actions/setup-dotnet@v6
+      with:
+        global-json-file: global.json
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'ga'
+
+    - name: Add nuget source
+      shell: pwsh
+      run: dotnet nuget add source --username ${{ vars.GSP_PACKAGE_USERNAME }} --password ${{ secrets.GSP_PACKAGE_PAT }} --store-password-in-clear-text --name github ${{ vars.NUGET_URL }}
+
+    - name: Run tests
+      shell: pwsh
+      run: dotnet test ./tests/GameshowPro.Mdns.Tests/GameshowPro.Mdns.Tests.csproj /p:TreatWarningsAsErrors=true -warnaserror -c ${{ matrix.configuration }}
+
   Build_And_Package:
     name: Build and package
+    needs: Test
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,9 +70,10 @@ jobs:
       with:
         fetch-depth: 0 # avoid shallow clone so nbgv can do its work.
 
-    - name: Use .NET 10.0.x
+    - name: Use pinned SDK and .NET 10 test runtime
       uses: actions/setup-dotnet@v6
       with:
+        global-json-file: global.json
         dotnet-version: '10.0.x'
         dotnet-quality: 'ga'
 
@@ -55,15 +86,11 @@ jobs:
       shell: pwsh
       run: dotnet nuget add source --username ${{ vars.GSP_PACKAGE_USERNAME }} --password ${{ secrets.GSP_PACKAGE_PAT }} --store-password-in-clear-text --name github ${{ vars.NUGET_URL }}
 
-    - name: Run tests
-      shell: pwsh
-      run: dotnet test $env:SLN_PATH -c ${{ matrix.package.configuration }}
-
     - name: Build and pack
       shell: pwsh
       id: pack
       run: |
-        dotnet pack $env:SLN_PATH --output ${{env.PUBLISH_PATH}} -c ${{ matrix.package.configuration }}
+        dotnet pack $env:SLN_PATH /p:TreatWarningsAsErrors=true -warnaserror --output ${{env.PUBLISH_PATH}} -c ${{ matrix.package.configuration }}
 
     - name: Upload
       uses: actions/upload-artifact@v7
@@ -85,6 +112,13 @@ jobs:
     - uses: actions/checkout@v7
       with:
         fetch-depth: 0 # For tag creation
+
+    - name: Use pinned SDK and .NET 10 runtime
+      uses: actions/setup-dotnet@v6
+      with:
+        global-json-file: global.json
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'ga'
 
     - name: Download all artifacts
       uses: actions/download-artifact@v8

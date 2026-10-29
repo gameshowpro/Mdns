@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <Choose>
     <When Condition="'$(Configuration)' == 'ReleaseWindows' OR '$(Configuration)' == 'DebugWindows'">
       <PropertyGroup>
@@ -40,6 +40,7 @@
     <Copyright>Barjonas LLC 2026</Copyright>
     <PackageTags>multicast mdns dns zeroconf</PackageTags>
     <IncludeSymbols>True</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>readme.md</PackageReadmeFile>
     <Configurations>Debug;Release;ReleaseWindows;DebugWindows</Configurations>
@@ -49,6 +50,11 @@
     <None Include="..\..\readme.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 	<ItemGroup>
+    <!-- Pin transitive dependencies from GameshowPro.Common without changing that package. -->
+    <PackageReference Include="MessagePack" Version="3.1.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.14" />
+    <!-- 18.10 and later require .NET 11; retain the newest .NET 10-supported version. -->
+    <PackageReference Include="Microsoft.NET.StringTools" Version="18.9.6" />
     <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
