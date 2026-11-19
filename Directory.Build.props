@@ -11,6 +11,9 @@
     <!-- Documentation generation runs IDE0005 during builds; public API XML comments are not a repository rule. -->
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Links each published package to this repository on GitHub Packages. -->
+    <RepositoryUrl>https://github.com/gameshowpro/Mdns</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Roslynator.Analyzers" Version="5.0.1">
