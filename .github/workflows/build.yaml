@@ -22,11 +22,11 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Use pinned SDK and .NET 10 test runtime
+    - name: Use pinned SDK and .NET 11 test runtime
       uses: actions/setup-dotnet@v6
       with:
         global-json-file: global.json
-        dotnet-version: '10.0.x'
+        dotnet-version: '11.0.x'
         dotnet-quality: 'ga'
 
     - name: Add nuget source
@@ -70,11 +70,11 @@ jobs:
       with:
         fetch-depth: 0 # avoid shallow clone so nbgv can do its work.
 
-    - name: Use pinned SDK and .NET 10 test runtime
+    - name: Use pinned SDK and .NET 11 test runtime
       uses: actions/setup-dotnet@v6
       with:
         global-json-file: global.json
-        dotnet-version: '10.0.x'
+        dotnet-version: '11.0.x'
         dotnet-quality: 'ga'
 
     - name: Nerdbank.GitVersioning
@@ -113,11 +113,11 @@ jobs:
       with:
         fetch-depth: 0 # For tag creation
 
-    - name: Use pinned SDK and .NET 10 runtime
+    - name: Use pinned SDK and .NET 11 runtime
       uses: actions/setup-dotnet@v6
       with:
         global-json-file: global.json
-        dotnet-version: '10.0.x'
+        dotnet-version: '11.0.x'
         dotnet-quality: 'ga'
 
     - name: Download all artifacts

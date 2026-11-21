@@ -2,7 +2,7 @@
   <Choose>
     <When Condition="'$(Configuration)' == 'ReleaseWindows' OR '$(Configuration)' == 'DebugWindows'">
       <PropertyGroup>
-        <TargetFrameworks>net10.0-windows</TargetFrameworks>
+        <TargetFrameworks>net11.0-windows</TargetFrameworks>
         <EnableWindowsTargeting>true</EnableWindowsTargeting>
         <DefineConstants>$(DefineConstants);WPF</DefineConstants>
         <Title>GameshowPro mDNS wrapper - Windows version</Title>
@@ -11,16 +11,16 @@
         <PackageId>GameshowPro.Mdns.Windows</PackageId>
       </PropertyGroup>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common.Windows" Version="1.4.10" />
+        <PackageReference Include="GameshowPro.Common.Windows" Version="1.4.32" />
         <!-- MahApps.Metro 2.4.11 requires ControlzEx below 6.0.0. -->
         <PackageReference Include="ControlzEx" Version="5.0.2" />
         <PackageReference Include="Microsoft.Xaml.Behaviors.Wpf" Version="1.1.161" />
-        <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.14" />
+        <PackageReference Include="System.ServiceProcess.ServiceController" Version="11.0.0" />
       </ItemGroup>
     </When>
     <Otherwise>
       <PropertyGroup>
-        <TargetFrameworks>net10.0</TargetFrameworks>
+        <TargetFrameworks>net11.0</TargetFrameworks>
         <Title>GameshowPro mDNS wrapper - Cross platform version</Title>
         <PackageId>GameshowPro.Mdns</PackageId>
       </PropertyGroup>
@@ -29,7 +29,7 @@
         <Compile Remove="**\*.xaml.cs" />
       </ItemGroup>
       <ItemGroup>
-        <PackageReference Include="GameshowPro.Common" Version="1.4.10" />
+        <PackageReference Include="GameshowPro.Common" Version="1.4.32" />
       </ItemGroup>
     </Otherwise>
   </Choose>
@@ -56,9 +56,8 @@
 	<ItemGroup>
     <!-- Pin transitive dependencies from GameshowPro.Common without changing that package. -->
     <PackageReference Include="MessagePack" Version="3.1.12" />
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.14" />
-    <!-- 18.10 and later require .NET 11; retain the newest .NET 10-supported version. -->
-    <PackageReference Include="Microsoft.NET.StringTools" Version="18.9.6" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="11.0.0" />
+    <PackageReference Include="Microsoft.NET.StringTools" Version="18.12.2" />
     <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
