@@ -47,6 +47,90 @@ public sealed class MdnsRuntimeTests
     }
 
     [Fact]
+    public void CustomHostNameIsUsedForSrvTargetAndAddressRecords()
+    {
+        MdnsPublication publication = new("node-1", "_https", "tcp", 9443,
+            new Dictionary<string, string>(), "studio-pc-triggergate");
+        IPAddress v6 = IPAddress.Parse("2001:db8::44");
+        ImmutableArray<DnsRecord> records = MdnsEngine.CreateRecords(publication, [s_local, v6]);
+        SrvData srv = Assert.IsType<SrvData>(Assert.Single(records.Where(r => r.Type == DnsTypes.Srv)).Data);
+        Assert.Equal("studio-pc-triggergate.local.", srv.Target);
+        DnsRecord a = Assert.Single(records.Where(r => r.Type == DnsTypes.A));
+        DnsRecord aaaa = Assert.Single(records.Where(r => r.Type == DnsTypes.Aaaa));
+        Assert.Equal("studio-pc-triggergate.local.", a.Name);
+        Assert.Equal("studio-pc-triggergate.local.", aaaa.Name);
+        Assert.DoesNotContain(records, r => r.Name.Contains("node-1.https", StringComparison.OrdinalIgnoreCase) &&
+            r.Type is DnsTypes.A or DnsTypes.Aaaa);
+        Assert.Contains(MdnsEngine.Query(new DnsMessage
+        {
+            Questions = [new("studio-pc-triggergate.local.", DnsTypes.A)]
+        }, records), r => r.Type == DnsTypes.A && Assert.IsType<AddressData>(r.Data).Address.Equals(s_local));
+        Assert.Contains(MdnsEngine.Query(new DnsMessage
+        {
+            Questions = [new("STUDIO-pc-triggergate.local.", DnsTypes.Aaaa)]
+        }, records), r => r.Type == DnsTypes.Aaaa && Assert.IsType<AddressData>(r.Data).Address.Equals(v6));
+    }
+
+    [Fact]
+    public void UnsetHostNameKeepsHistoricalHostIdentity()
+    {
+        MdnsPublication publication = new("node-1", "_osc_json", "tcp", 9000, new Dictionary<string, string>());
+        ImmutableArray<DnsRecord> records = MdnsEngine.CreateRecords(publication, [s_local]);
+        Assert.Equal("node-1.osc-json.local.", Assert.IsType<SrvData>(
+            Assert.Single(records.Where(r => r.Type == DnsTypes.Srv)).Data).Target);
+        Assert.Equal("node-1.osc-json.local.", Assert.Single(records.Where(r => r.Type == DnsTypes.A)).Name);
+    }
+
+    [Fact]
+    public void SharedHostNameServicesHaveEquivalentAddressRecordsAndNoGoodbyeForThem()
+    {
+        MdnsPublication https = new("studio", "_https", "tcp", 9443, new Dictionary<string, string>(), "studio-pc");
+        MdnsPublication http = new("studio", "_http", "tcp", 9090, new Dictionary<string, string>(), "studio-pc");
+        ImmutableArray<DnsRecord> httpsRecords = MdnsEngine.CreateRecords(https, [s_local]);
+        ImmutableArray<DnsRecord> httpRecords = MdnsEngine.CreateRecords(http, [s_local]);
+        Assert.False(MdnsEngine.HasConflict(new DnsMessage { Answers = httpsRecords }, httpRecords));
+        Assert.False(MdnsEngine.HasConflict(new DnsMessage { Answers = httpRecords }, httpsRecords));
+        ImmutableArray<DnsRecord> goodbye = MdnsEngine.Goodbye(httpsRecords, httpRecords);
+        Assert.DoesNotContain(goodbye, r => r.Type is DnsTypes.A or DnsTypes.Aaaa);
+        Assert.Contains(goodbye, r => r.Type == DnsTypes.Srv);
+        Assert.All(goodbye, r => Assert.Equal(0u, r.Ttl));
+        Assert.Contains(MdnsEngine.Goodbye(httpsRecords, []), r => r.Type == DnsTypes.A);
+    }
+
+    [Fact]
+    public async Task SharedHostNameRegistrationsCoexistAndWithdrawalKeepsAddressRecordsLive()
+    {
+        (NetworkInterface Nic, IPAddress Address) selected = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up)
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses
+                .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
+                .Select(a => (Nic: n, Address: a.Address)))
+            .OrderByDescending(x => IPAddress.IsLoopback(x.Address)).FirstOrDefault();
+        if (selected.Nic is null)
+        {
+            throw Xunit.Sdk.SkipException.ForSkip("No active IPv4 interface is available.");
+        }
+
+        MdnsScope scope = new(selected.Nic.Id, selected.Address);
+        string suffix = Guid.NewGuid().ToString("N")[..6];
+        string host = "sharedhost-" + suffix;
+        MdnsPublication https = new("inst-" + suffix, "_httpstest" + suffix, "tcp", 49011,
+            new Dictionary<string, string>(), host);
+        MdnsPublication http = https with { ServiceType = "_httptest" + suffix, Port = 49012 };
+        await using MdnsRegistration one = await MdnsRuntime.RegisterAsync(https, scope, NullLogger.Instance);
+        await using MdnsRegistration two = await MdnsRuntime.RegisterAsync(http, scope, NullLogger.Instance);
+        Assert.Null(one.Failure);
+        Assert.Null(two.Failure);
+        using UdpClient probe = new(new IPEndPoint(selected.Address, 0));
+        ImmutableArray<DnsRecord> before = await QueryAddress(probe, selected.Address, host);
+        Assert.Contains(before, r => Assert.IsType<AddressData>(r.Data).Address.Equals(selected.Address));
+        await one.DisposeAsync();
+        Assert.Null(two.Failure);
+        ImmutableArray<DnsRecord> after = await QueryAddress(probe, selected.Address, host);
+        Assert.Contains(after, r => Assert.IsType<AddressData>(r.Data).Address.Equals(selected.Address));
+    }
+
+    [Fact]
     public void ConflictChecksWholeOwnedAddressSet()
     {
         MdnsPublication publication = new("node-1", "_osc", "udp", 9000,
@@ -304,6 +388,34 @@ public sealed class MdnsRuntimeTests
             answers.AddRange(decoded.Answers.Where(r => r.Type == DnsTypes.Ptr));
         }
         return answers.ToImmutable();
+    }
+
+    private static async Task<ImmutableArray<DnsRecord>> QueryAddress(UdpClient probe, IPAddress address, string host)
+    {
+        ushort id = checked((ushort)Random.Shared.Next(1, ushort.MaxValue));
+        DnsMessage message = new()
+        {
+            Id = id,
+            Questions = [new($"{host}.local.", DnsTypes.A, 0x8001)]
+        };
+        _ = await probe.SendAsync(DnsCodec.Write(message), new IPEndPoint(address, 5353));
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
+        while (true)
+        {
+            UdpReceiveResult response = await probe.ReceiveAsync(timeout.Token);
+            if (response.RemoteEndPoint.Port != 5353 ||
+                !DnsCodec.TryRead(response.Buffer, out DnsMessage? decoded) || decoded!.Id != id)
+            {
+                continue;
+            }
+
+            ImmutableArray<DnsRecord> answers = [.. decoded.Answers.Where(r => r.Type == DnsTypes.A &&
+                r.Ttl > 0 && DnsNames.Equals(r.Name, $"{host}.local."))];
+            if (!answers.IsEmpty)
+            {
+                return answers;
+            }
+        }
     }
 
     private static async Task<ImmutableArray<DnsRecord>> QueryMulticast(Socket probe,

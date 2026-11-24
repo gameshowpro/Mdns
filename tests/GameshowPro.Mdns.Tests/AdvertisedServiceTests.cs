@@ -14,6 +14,33 @@ public sealed class AdvertisedServiceTests
             new AdvertisedServiceOptions { LocalAddress = IPAddress.Loopback }, NullLogger.Instance));
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("-leading")]
+    [InlineData("trailing-")]
+    [InlineData("has.dot")]
+    [InlineData("has_underscore")]
+    [InlineData("has space")]
+    [InlineData("café")]
+    public void InvalidHostNameIsRejected(string hostName)
+    {
+        _ = Assert.Throws<ArgumentException>(() => new AdvertisedService(
+            new InstanceProperties("_https", "tcp", 9443),
+            new AdvertisedServiceOptions { HostName = hostName }, NullLogger.Instance));
+    }
+
+    [Fact]
+    public void OverlongHostNameIsRejectedAndLongestLabelAccepted()
+    {
+        _ = Assert.Throws<ArgumentException>(() => new AdvertisedService(
+            new InstanceProperties("_https", "tcp", 9443),
+            new AdvertisedServiceOptions { HostName = new string('a', 64) }, NullLogger.Instance));
+        _ = new AdvertisedService(new InstanceProperties("_https", "tcp", 9443),
+            new AdvertisedServiceOptions { HostName = new string('a', 63) }, NullLogger.Instance);
+        _ = new AdvertisedService(new InstanceProperties("_https", "tcp", 9443),
+            new AdvertisedServiceOptions { HostName = "Studio-PC-1" }, NullLogger.Instance);
+    }
+
     [Fact]
     public async Task DisposedPublisherRejectsStartAndRepeatedDisposeIsSafe()
     {

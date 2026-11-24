@@ -2,7 +2,7 @@ namespace GameshowPro.Mdns.Internal;
 
 internal sealed record MdnsScope(string? NetworkInterfaceId = null, IPAddress? LocalAddress = null);
 internal sealed record MdnsPublication(string InstanceName, string ServiceType, string Protocol,
-    ushort Port, IReadOnlyDictionary<string, string> TxtProperties);
+    ushort Port, IReadOnlyDictionary<string, string> TxtProperties, string? HostName = null);
 internal sealed record MdnsPacket(DnsMessage Message, int InterfaceIndex, IPAddress Destination, IPAddress Source);
 
 /// <summary>Record construction and query matching shared by every registration in this process.</summary>
@@ -18,8 +18,11 @@ internal static class MdnsEngine
         string instance = DnsNames.FromLabels(publication.InstanceName, publication.ServiceType,
             "_" + publication.Protocol, "local");
         // Retain the historical host identity expected by existing GameshowPro consumers.
-        string host = DnsNames.FromLabels(publication.InstanceName,
-            publication.ServiceType.TrimStart('_').Replace('_', '-'), "local");
+        // An explicit HostName replaces it with <HostName>.local, shared by every publication that names it.
+        string host = publication.HostName is { } hostName
+            ? DnsNames.FromLabels(hostName, "local")
+            : DnsNames.FromLabels(publication.InstanceName,
+                publication.ServiceType.TrimStart('_').Replace('_', '-'), "local");
         ImmutableArray<byte[]> txt = [.. publication.TxtProperties.Select(pair => Encoding.UTF8.GetBytes(
             string.Concat(pair.Key, "=", pair.Value)))];
         if (txt.IsEmpty)

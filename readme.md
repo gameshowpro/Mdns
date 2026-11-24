@@ -35,6 +35,8 @@ await using AdvertisedService publisher = new(
 await publisher.StartAsync(stoppingToken);
 ```
 
+`HostName` is optional. It is a single DNS label (`a-z`, `0-9`, `-`; 1 to 63 characters; no leading or trailing `-`; letters in either case, published as given). When set, the SRV target and the A/AAAA records use `<HostName>.local`, so the name answers address queries directly. Services in one process that share a `HostName` (for example `_https._tcp` and `_http._tcp`) share its address records: they do not conflict with each other, and withdrawing one keeps the addresses live for the other. Choose a `HostName` that no other process or machine owns. Unset, the host stays `<InstanceName>.<service>.local` as before. An invalid label throws `ArgumentException` from the constructor.
+
 `InstanceName` and `TxtProperties` are optional. The library adds a `machineName` TXT value for localhost filtering. An explicit interface requires its local IPv4 or IPv6 address; omitted scope uses the default eligible interfaces. `StartAsync` reports startup failures as exceptions, and `Failure` exposes a later runtime failure. A disposed publisher cannot restart; create a new one to retry. `AdvertiseUntilCancelled` uses the same publication lifecycle and withdraws on cancellation.
 
 ## Find services

@@ -21,6 +21,7 @@ public class AdvertisedService : IAsyncDisposable
         _options = new AdvertisedServiceOptions
         {
             InstanceName = options.InstanceName,
+            HostName = options.HostName,
             NetworkInterfaceId = options.NetworkInterfaceId,
             LocalAddress = options.LocalAddress,
             TxtProperties = options.TxtProperties?.ToFrozenDictionary(pair => pair.Key, pair => pair.Value,
@@ -46,7 +47,18 @@ public class AdvertisedService : IAsyncDisposable
         {
             throw new ArgumentException("LocalAddress must be IPv4 or IPv6.", nameof(options));
         }
+
+        if (_options.HostName is { } hostName && !IsValidHostLabel(hostName))
+        {
+            throw new ArgumentException(
+                "HostName must be a single DNS label of 1 to 63 letters, digits, or hyphens, not starting or ending with a hyphen.",
+                nameof(options));
+        }
     }
+
+    private static bool IsValidHostLabel(string label) =>
+        label.Length is >= 1 and <= 63 && label[0] != '-' && label[^1] != '-' &&
+        label.All(c => c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-');
 
     public string? Failure => _registration?.Failure ?? Volatile.Read(ref _failure);
 
@@ -74,7 +86,7 @@ public class AdvertisedService : IAsyncDisposable
             txt[TxtRecordMachineName] = Environment.MachineName;
             MdnsPublication publication = new(
                 _options.InstanceName ?? Environment.MachineName,
-                _properties.ServiceType, _properties.Protocol, _properties.Port, txt);
+                _properties.ServiceType, _properties.Protocol, _properties.Port, txt, _options.HostName);
             try
             {
                 MdnsRegistration registration = await MdnsRuntime.RegisterAsync(publication,
