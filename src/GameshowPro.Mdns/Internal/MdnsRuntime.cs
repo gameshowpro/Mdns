@@ -14,6 +14,9 @@ internal sealed class MdnsRegistration : IAsyncDisposable
     internal bool Conflict { get; set; }
     internal DateTimeOffset? LastConflict { get; set; }
     internal bool Recovering { get; set; }
+    internal int SendFailures { get; set; }
+    internal CancellationTokenSource Stop { get; } = new();
+    internal Dictionary<string, ImmutableArray<DnsRecord>> Advertised { get; } = new(StringComparer.Ordinal);
     public string? Failure { get; internal set; }
     public ValueTask DisposeAsync() => MdnsRuntime.RemoveAsync(this);
 }
@@ -41,6 +44,14 @@ internal static class MdnsRuntime
     private static readonly Dictionary<string, MdnsChannel> s_channels = new(StringComparer.Ordinal);
     private static readonly SemaphoreSlim s_lifecycle = new(1, 1);
     private static readonly HashSet<Task> s_backgroundTasks = [];
+    private static readonly List<Transmission> s_transmissions = [];
+    private static IReadOnlyList<MdnsAddress>? s_testAddresses;
+    private static Action<MdnsAddress, byte[], IPEndPoint?>? s_testSend;
+    private static Func<DateTimeOffset> s_now = () => DateTimeOffset.UtcNow;
+    private static Func<TimeSpan, Task> s_delay = delay => Task.Delay(delay);
+    private static readonly TimeSpan s_transmissionLifetime = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan s_conflictCooldown = TimeSpan.FromSeconds(10);
+    private sealed record Transmission(byte[] Source, byte[] Datagram, DateTimeOffset Sent);
     private static Socket? s_receive4, s_receive6;
     private static CancellationTokenSource? s_stop;
     private static Task? s_maintenance;
@@ -83,13 +94,7 @@ internal static class MdnsRuntime
             {
                 s_registrations.Add(registration);
                 ReconcileLocked();
-                if (registration.Failure is null && s_channels.Values.Any(channel =>
-                    ScopeIncludesChannel(scope, channel) && s_registrations.Any(other => other != registration &&
-                    other.Active && ScopeIncludesChannel(other.Scope, channel) &&
-                    MdnsEngine.HasConflict(new DnsMessage
-                    {
-                        Answers = RecordsForInterface(registration, channel)
-                    }, RecordsForInterface(other, channel)))))
+                if (registration.Failure is null && HasLocalConflict(registration))
                 {
                     registration.Failure = "The selected mDNS service or host name is already owned by another local registration.";
                 }
@@ -118,7 +123,7 @@ internal static class MdnsRuntime
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 Probe(registration);
-                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                await s_delay(TimeSpan.FromMilliseconds(250)).WaitAsync(cancellationToken).ConfigureAwait(false);
                 if (registration.Failure is not null)
                 {
                     return registration;
@@ -137,7 +142,11 @@ internal static class MdnsRuntime
             // The caller token only governs startup; registration disposal guards the later announcement.
             Track(Task.Run(async () =>
             {
-                await Task.Delay(1000).ConfigureAwait(false);
+                try
+                {
+                    await s_delay(TimeSpan.FromSeconds(1)).WaitAsync(registration.Stop.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (registration.Disposed) { return; }
                 if (!registration.Disposed && registration.Failure is null)
                 {
                     Announce(registration);
@@ -195,6 +204,7 @@ internal static class MdnsRuntime
                 }
 
                 registration.Disposed = true;
+                registration.Stop.Cancel();
                 _ = s_registrations.Remove(registration);
                 s_generation++;
                 goodbyes = [.. s_channels.Values.Where(c => ScopeIncludesChannel(registration.Scope, c))
@@ -255,6 +265,7 @@ internal static class MdnsRuntime
             }
 
             s_channels.Clear();
+            s_transmissions.Clear();
             s_receive4?.Dispose(); s_receive6?.Dispose();
             s_receive4 = s_receive6 = null;
             s_stop = null;
@@ -291,6 +302,7 @@ internal static class MdnsRuntime
 
         long generation = ++s_runtimeGeneration;
         s_stop = new CancellationTokenSource();
+        if (s_testAddresses is not null) { return; }
         s_receive4 = OpenReceiver(AddressFamily.InterNetwork);
         s_receive6 = OpenReceiver(AddressFamily.InterNetworkV6);
         if (s_receive4 is not null)
@@ -340,9 +352,13 @@ internal static class MdnsRuntime
 
         EnsureReceiversLocked();
         List<MdnsAddress> available = EnumerateAddresses();
+        Dictionary<MdnsRegistration, Dictionary<string, ImmutableArray<DnsRecord>>> next = [];
         foreach (MdnsRegistration registration in s_registrations)
         {
             MdnsAddress[] selected = [.. Select(available, registration.Scope)];
+            next[registration] = selected.GroupBy(x => x.InterfaceId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => MdnsEngine.CreateRecords(registration.Publication,
+                    [.. group.Select(x => x.Address)]), StringComparer.OrdinalIgnoreCase);
             if (selected.Length == 0)
             {
                 registration.Failure = "Selected mDNS interface or address is unavailable.";
@@ -351,7 +367,7 @@ internal static class MdnsRuntime
             }
             else if (!registration.Conflict)
             {
-                registration.Failure = null;
+                if (!registration.Recovering || registration.Active) { registration.Failure = null; }
                 registration.Records = MdnsEngine.CreateRecords(registration.Publication,
                     selected.Select(x => x.Address).ToArray());
                 if (registration.EverActive && !registration.Active && !registration.Recovering)
@@ -364,9 +380,32 @@ internal static class MdnsRuntime
         MdnsAddress[] desired = [.. s_registrations.SelectMany(r => Select(available, r.Scope))
             .Concat(s_browsers.Count > 0 ? available : [])
             .DistinctBy(x => x.Key)];
+        foreach (MdnsRegistration registration in s_registrations.Where(r => r.Advertised.Count > 0 && !r.Disposed))
+        {
+            foreach ((string interfaceId, ImmutableArray<DnsRecord> oldRecords) in registration.Advertised)
+            {
+                ImmutableArray<DnsRecord> replacement = next[registration].GetValueOrDefault(interfaceId, []);
+                ImmutableArray<DnsRecord> retained = [.. s_registrations.Where(r => r != registration && r.Active && !r.Disposed)
+                    .SelectMany(r => next[r].GetValueOrDefault(interfaceId, [])), .. replacement];
+                ImmutableArray<DnsRecord> goodbye = MdnsEngine.Goodbye(oldRecords, retained);
+                if (!goodbye.IsEmpty)
+                {
+                    foreach (MdnsChannel channel in s_channels.Values.Where(c =>
+                                 string.Equals(c.Address.InterfaceId, interfaceId, StringComparison.OrdinalIgnoreCase) &&
+                                 desired.Any(address => address.Key == c.Address.Key)))
+                    {
+                        SendMessage(channel, new DnsMessage { Flags = 0x8400, Answers = goodbye }, null);
+                    }
+                }
+            }
+        }
         foreach (string? old in s_channels.Keys.Except(desired.Select(x => x.Key)).ToArray())
         {
             s_channels[old].Dispose(); _ = s_channels.Remove(old);
+        }
+        foreach (MdnsRegistration registration in s_registrations.Where(r => !r.Active))
+        {
+            registration.Advertised.Clear();
         }
         foreach (MdnsAddress endpoint in desired)
         {
@@ -377,20 +416,13 @@ internal static class MdnsRuntime
 
             try
             {
-                MdnsChannel channel = new(endpoint, endpoint.Address.AddressFamily == AddressFamily.InterNetwork
-                    ? s_receive4 : s_receive6,
-                    (socket, token) => ReceiveLoop(socket, s_runtimeGeneration, token), s_stop!.Token);
+                MdnsChannel channel = s_testSend is null
+                    ? new(endpoint, endpoint.Address.AddressFamily == AddressFamily.InterNetwork
+                        ? s_receive4 : s_receive6,
+                        (socket, token) => ReceiveLoop(socket, s_runtimeGeneration, token), s_stop!.Token)
+                    : new(endpoint, s_testSend);
                 s_channels.Add(endpoint.Key, channel);
                 Track(channel.ReceiveTask);
-                foreach (MdnsRegistration registration in s_registrations.Where(r => r.Active && r.Failure is null &&
-                             ScopeIncludesChannel(r.Scope, channel)))
-                {
-                    SendMessage(channel, new DnsMessage
-                    {
-                        Flags = 0x8400,
-                        Answers = RecordsForInterface(registration, channel)
-                    }, null);
-                }
             }
             catch (Exception ex)
             {
@@ -407,6 +439,54 @@ internal static class MdnsRuntime
                 registration.Failure = "No usable mDNS socket is available for the selected scope.";
             }
         }
+        foreach (MdnsRegistration registration in s_registrations.Where(r => r.Active && !r.Disposed))
+        {
+            if (!HasLocalConflict(registration, true)) { continue; }
+            registration.Active = false;
+            registration.Failure = "The selected mDNS service or host name is already owned by another local registration.";
+            foreach ((string interfaceId, ImmutableArray<DnsRecord> oldRecords) in registration.Advertised)
+            {
+                ImmutableArray<DnsRecord> retained = [.. s_registrations.Where(r => r != registration && r.Active)
+                    .SelectMany(r => next[r].GetValueOrDefault(interfaceId, []))];
+                ImmutableArray<DnsRecord> goodbye = MdnsEngine.Goodbye(oldRecords, retained);
+                foreach (MdnsChannel channel in s_channels.Values.Where(c =>
+                             string.Equals(c.Address.InterfaceId, interfaceId, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (!goodbye.IsEmpty)
+                    {
+                        SendMessage(channel, new DnsMessage { Flags = 0x8400, Answers = goodbye }, null);
+                    }
+                }
+            }
+            registration.Advertised.Clear();
+            if (!registration.Recovering)
+            {
+                registration.Recovering = true;
+                Track(Task.Run(() => Recover(registration)));
+            }
+        }
+        foreach (MdnsRegistration registration in s_registrations.Where(r => r.Active && !r.Disposed))
+        {
+            foreach ((string interfaceId, ImmutableArray<DnsRecord> records) in next[registration])
+            {
+                bool changed = !registration.Advertised.TryGetValue(interfaceId, out ImmutableArray<DnsRecord> old) ||
+                    !SameRecords(old, records);
+                if (changed)
+                {
+                    foreach (MdnsChannel channel in s_channels.Values.Where(c =>
+                        string.Equals(c.Address.InterfaceId, interfaceId, StringComparison.OrdinalIgnoreCase) &&
+                        ScopeIncludesChannel(registration.Scope, c)))
+                    {
+                        SendMessage(channel, new DnsMessage { Flags = 0x8400, Answers = records }, null);
+                    }
+                }
+            }
+            registration.Advertised.Clear();
+            foreach ((string interfaceId, ImmutableArray<DnsRecord> records) in next[registration])
+            {
+                registration.Advertised[interfaceId] = records;
+            }
+        }
 
         foreach (MdnsBrowseSubscription browser in s_browsers)
         {
@@ -416,6 +496,7 @@ internal static class MdnsRuntime
 
     private static List<MdnsAddress> EnumerateAddresses()
     {
+        if (s_testAddresses is not null) { return [.. s_testAddresses]; }
         List<MdnsAddress> result = [];
         foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -453,42 +534,199 @@ internal static class MdnsRuntime
         return result;
     }
 
-    private static IEnumerable<MdnsAddress> Select(IEnumerable<MdnsAddress> available, MdnsScope scope)
+    private static IEnumerable<IPAddress> CurrentLocalAddresses()
+    {
+        foreach (MdnsAddress address in EnumerateAddresses()) { yield return address.Address; }
+    }
+
+    internal static IDisposable InstallTestTransport(IReadOnlyList<MdnsAddress> addresses,
+        Action<MdnsAddress, byte[], IPEndPoint?> send, Func<DateTimeOffset> now, Func<TimeSpan, Task> delay)
+    {
+        lock (s_gate)
+        {
+            if (s_registrations.Count != 0 || s_browsers.Count != 0 || s_channels.Count != 0)
+            {
+                throw new InvalidOperationException("The mDNS runtime must be idle before installing test transport.");
+            }
+            s_testAddresses = addresses;
+            s_testSend = send;
+            s_now = now;
+            s_delay = delay;
+            return new TestTransportLease();
+        }
+    }
+
+    private sealed class TestTransportLease : IDisposable
+    {
+        public void Dispose()
+        {
+            lock (s_gate)
+            {
+                if (s_registrations.Count != 0 || s_browsers.Count != 0)
+                {
+                    throw new InvalidOperationException("Dispose test registrations before removing test transport.");
+                }
+                s_testAddresses = null;
+                s_testSend = null;
+                s_now = () => DateTimeOffset.UtcNow;
+                s_delay = delay => Task.Delay(delay);
+                s_transmissions.Clear();
+            }
+        }
+    }
+
+    internal static void ReconcileForTest()
+    {
+        lock (s_gate) { ReconcileLocked(); }
+    }
+
+    internal static void DispatchForTest(byte[] datagram, int interfaceIndex, IPAddress destination,
+        IPEndPoint source)
+    {
+        if (DnsCodec.TryRead(datagram, out DnsMessage? message))
+        {
+            Dispatch(message!, datagram, interfaceIndex, destination, source);
+        }
+    }
+
+    internal static IEnumerable<MdnsAddress> Select(IEnumerable<MdnsAddress> available, MdnsScope scope)
     {
         MdnsAddress[] all = [.. available];
         IEnumerable<MdnsAddress> candidates = scope.NetworkInterfaceId is null && scope.LocalAddress is null &&
+            scope.LocalAddresses is null &&
             all.Any(x => !IPAddress.IsLoopback(x.Address))
             ? all.Where(x => !IPAddress.IsLoopback(x.Address)) : all.AsEnumerable();
         return candidates.Where(x => (scope.NetworkInterfaceId is null ||
                 string.Equals(scope.NetworkInterfaceId, x.InterfaceId, StringComparison.OrdinalIgnoreCase)) &&
-            (scope.LocalAddress is null || scope.LocalAddress.Equals(x.Address)));
+            (scope.LocalAddress is null || scope.LocalAddress.Equals(x.Address)) &&
+            (scope.LocalAddresses is null || scope.LocalAddresses.Any(address => AddressEquals(address, x.Address))));
+    }
+
+    private static bool AddressEquals(IPAddress left, IPAddress right) =>
+        left.AddressFamily == right.AddressFamily && left.GetAddressBytes().AsSpan().SequenceEqual(right.GetAddressBytes()) &&
+        (!left.IsIPv6LinkLocal || left.ScopeId == right.ScopeId);
+
+    private static bool SameRecords(ImmutableArray<DnsRecord> left, ImmutableArray<DnsRecord> right) =>
+        left.Length == right.Length && left.All(record => right.Any(other => DnsRecords.Equivalent(record, other)));
+
+    private static bool HasLocalConflict(MdnsRegistration registration, bool addressChangeOnly = false)
+    {
+        MdnsAddress[] available = [.. s_channels.Values.Select(channel => channel.Address)];
+        IEnumerable<MdnsRegistration> others = addressChangeOnly
+            ? s_registrations.TakeWhile(other => other != registration) : s_registrations;
+        foreach (MdnsRegistration other in others.Where(other => other != registration &&
+                     other.Active && !other.Disposed))
+        {
+            foreach (IGrouping<string, MdnsAddress> selected in Select(available, registration.Scope)
+                         .GroupBy(address => address.InterfaceId, StringComparer.OrdinalIgnoreCase))
+            {
+                MdnsAddress[] theirs = [.. Select(available, other.Scope).Where(address =>
+                    string.Equals(address.InterfaceId, selected.Key, StringComparison.OrdinalIgnoreCase))];
+                if (theirs.Length == 0)
+                {
+                    continue;
+                }
+
+                bool explicitSet = registration.Scope.LocalAddresses is not null ||
+                    other.Scope.LocalAddresses is not null;
+                if (addressChangeOnly && !explicitSet || !explicitSet &&
+                    !selected.Any(ours => theirs.Any(theirsAddress => ours.Key == theirsAddress.Key)))
+                {
+                    continue;
+                }
+
+                ImmutableArray<DnsRecord> ours = MdnsEngine.CreateRecords(registration.Publication,
+                    [.. selected.Select(address => address.Address)]);
+                ImmutableArray<DnsRecord> otherRecords = MdnsEngine.CreateRecords(other.Publication,
+                    [.. theirs.Select(address => address.Address)]);
+                bool legacyConflict = MdnsEngine.HasConflict(new DnsMessage { Answers = ours }, otherRecords);
+                if (legacyConflict)
+                {
+                    return true;
+                }
+
+                if (explicitSet)
+                {
+                    string ourHost = ((SrvData)ours.First(record => record.Type == DnsTypes.Srv).Data).Target;
+                    string theirHost = ((SrvData)otherRecords.First(record => record.Type == DnsTypes.Srv).Data).Target;
+                    if (DnsNames.Equals(ourHost, theirHost) &&
+                        !SameAddressSet(ours, otherRecords))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool SameAddressSet(ImmutableArray<DnsRecord> left, ImmutableArray<DnsRecord> right)
+    {
+        DnsRecord[] addresses = [.. left.Where(record => record.Type is DnsTypes.A or DnsTypes.Aaaa)];
+        DnsRecord[] otherAddresses = [.. right.Where(record => record.Type is DnsTypes.A or DnsTypes.Aaaa)];
+        return addresses.Length == otherAddresses.Length &&
+            addresses.All(record => otherAddresses.Any(other => DnsRecords.Equivalent(record, other)));
     }
 
     private static async Task Recover(MdnsRegistration registration)
     {
         try
         {
-            for (int i = 0; i < 3; i++)
+            while (!registration.Disposed)
             {
-                if (registration.Disposed || registration.Failure is not null)
+                DateTimeOffset? last;
+                lock (s_gate) { last = registration.LastConflict; }
+                if (last is not null)
                 {
-                    return;
+                    TimeSpan wait = last.Value + s_conflictCooldown - s_now();
+                    if (wait > TimeSpan.Zero)
+                    {
+                        await s_delay(wait).WaitAsync(registration.Stop.Token).ConfigureAwait(false);
+                    }
                 }
-
-                Probe(registration);
-                await Task.Delay(250).ConfigureAwait(false);
-            }
-            lock (s_gate)
-            {
-                if (registration.Disposed || registration.Failure is not null)
+                bool retry;
+                lock (s_gate)
                 {
-                    return;
+                    if (registration.Disposed) { return; }
+                    retry = registration.LastConflict != last || HasLocalConflict(registration) ||
+                        !s_channels.Values.Any(channel => ScopeIncludesChannel(registration.Scope, channel));
+                    if (!retry)
+                    {
+                        registration.Conflict = false;
+                    }
                 }
-
-                registration.Active = true;
+                if (retry)
+                {
+                    await s_delay(TimeSpan.FromSeconds(1)).WaitAsync(registration.Stop.Token).ConfigureAwait(false);
+                    continue;
+                }
+                string? previousFailure = registration.Failure;
+                int previousSendFailures = registration.SendFailures;
+                for (int i = 0; i < 3; i++)
+                {
+                    Probe(registration);
+                    await s_delay(TimeSpan.FromMilliseconds(250)).WaitAsync(registration.Stop.Token).ConfigureAwait(false);
+                    if (registration.Disposed || registration.Conflict || registration.SendFailures != previousSendFailures ||
+                        registration.Failure != previousFailure) { break; }
+                }
+                lock (s_gate)
+                {
+                    if (registration.Disposed) { return; }
+                    if (registration.Conflict || registration.SendFailures != previousSendFailures ||
+                        registration.Failure != previousFailure || HasLocalConflict(registration) ||
+                        !s_channels.Values.Any(channel => ScopeIncludesChannel(registration.Scope, channel)))
+                    {
+                        continue;
+                    }
+                    registration.Active = true;
+                    registration.EverActive = true;
+                    registration.Failure = null;
+                }
+                Announce(registration);
+                return;
             }
-            Announce(registration);
         }
+        catch (OperationCanceledException) when (registration.Disposed) { }
         catch (Exception ex) { registration.Failure = ex.Message; }
         finally { registration.Recovering = false; }
     }
@@ -539,7 +777,7 @@ internal static class MdnsRuntime
 
                 if (generation == Volatile.Read(ref s_runtimeGeneration))
                 {
-                    Dispatch(decoded!, received.PacketInformation.Interface,
+                    Dispatch(decoded!, buffer.AsSpan(0, received.ReceivedBytes), received.PacketInformation.Interface,
                         received.PacketInformation.Address, source);
                 }
             }
@@ -579,7 +817,8 @@ internal static class MdnsRuntime
         }
     }
 
-    private static void Dispatch(DnsMessage message, int interfaceIndex, IPAddress destination, IPEndPoint source)
+    private static void Dispatch(DnsMessage message, ReadOnlySpan<byte> datagram, int interfaceIndex,
+        IPAddress destination, IPEndPoint source)
     {
         if ((message.Flags & 0x780f) != 0 || message.IsResponse && source.Port != 5353)
         {
@@ -590,6 +829,7 @@ internal static class MdnsRuntime
         MdnsBrowseSubscription[] browsers;
         lock (s_gate)
         {
+            bool ownPacket = IsOwnPacket(source, datagram, CurrentLocalAddresses(), s_now());
             channels = [.. s_channels.Values.Where(c => c.Address.InterfaceIndex == interfaceIndex &&
                 (destination.Equals(c.Address.Address) || IsGroupDestination(destination, c.Group)))];
             if (channels.Length == 0)
@@ -598,16 +838,21 @@ internal static class MdnsRuntime
             }
 
             browsers = [.. s_browsers.Where(b => !b.Disposed)];
-            if (message.IsResponse || source.Port == 5353 && !message.Authorities.IsEmpty)
+            if (!ownPacket && (message.IsResponse || source.Port == 5353 && !message.Authorities.IsEmpty))
             {
-                foreach (MdnsRegistration registration in s_registrations.Where(r => !r.Disposed && r.Failure is null))
+                foreach (MdnsRegistration registration in s_registrations.Where(r => !r.Disposed &&
+                             (r.Failure is null || r.Conflict || r.Recovering)))
                 {
                     if ((!registration.Active || message.IsResponse) &&
                         channels.Any(channel => ScopeIncludesChannel(registration.Scope, channel) &&
                         MdnsEngine.HasConflict(message, RecordsForInterface(registration, channel))))
                     {
-                        DateTimeOffset now = DateTimeOffset.UtcNow;
-                        if (registration.Active &&
+                        DateTimeOffset now = s_now();
+                        if (registration.Conflict)
+                        {
+                            registration.LastConflict = now;
+                        }
+                        else if (registration.Active &&
                             (registration.LastConflict is null || now - registration.LastConflict > TimeSpan.FromSeconds(10)))
                         {
                             registration.LastConflict = now;
@@ -617,7 +862,13 @@ internal static class MdnsRuntime
                         {
                             registration.Conflict = true;
                             registration.Active = false;
+                            registration.LastConflict = now;
                             registration.Failure = "Another mDNS responder owns this service or host name.";
+                            if (registration.EverActive && !registration.Recovering)
+                            {
+                                registration.Recovering = true;
+                                Track(Task.Run(() => Recover(registration)));
+                            }
                         }
                     }
                 }
@@ -723,16 +974,19 @@ internal static class MdnsRuntime
 
     private static void Probe(MdnsRegistration registration)
     {
-        foreach (MdnsChannel channel in ChannelsFor(registration.Scope))
+        lock (s_gate)
         {
-            ImmutableArray<DnsRecord> owned = RecordsForInterface(registration, channel);
-            ImmutableArray<DnsQuestion> questions = [.. owned.Where(r => r.CacheFlush)
-                .Select(r => new DnsQuestion(r.Name, DnsTypes.Any)).DistinctBy(q => q.Name)];
-            SendMessage(channel, new DnsMessage
+            foreach (MdnsChannel channel in ChannelsFor(registration.Scope))
             {
-                Questions = questions,
-                Authorities = [.. owned.Where(r => r.CacheFlush)]
-            }, null);
+                ImmutableArray<DnsRecord> owned = RecordsForInterface(registration, channel);
+                ImmutableArray<DnsQuestion> questions = [.. owned.Where(r => r.CacheFlush)
+                    .Select(r => new DnsQuestion(r.Name, DnsTypes.Any)).DistinctBy(q => q.Name)];
+                SendMessage(channel, new DnsMessage
+                {
+                    Questions = questions,
+                    Authorities = [.. owned.Where(r => r.CacheFlush)]
+                }, null);
+            }
         }
     }
 
@@ -747,11 +1001,13 @@ internal static class MdnsRuntime
 
             foreach (MdnsChannel channel in ChannelsFor(registration.Scope))
             {
+                ImmutableArray<DnsRecord> records = RecordsForInterface(registration, channel);
                 SendMessage(channel, new DnsMessage
                 {
                     Flags = 0x8400,
-                    Answers = RecordsForInterface(registration, channel)
+                    Answers = records
                 }, null);
+                if (registration.Failure is null) { registration.Advertised[channel.Address.InterfaceId] = records; }
             }
         }
     }
@@ -863,8 +1119,7 @@ internal static class MdnsRuntime
         ImmutableArray<DnsRecord> records = message.Answers;
         if (records.Length == 0)
         {
-            try { channel.Send(DnsCodec.Write(message), destination); }
-            catch (Exception ex) { ReportSendFailure(channel, ex); }
+            TrySend(channel, message, destination);
             return;
         }
         ImmutableArray<DnsRecord>.Builder batch = ImmutableArray.CreateBuilder<DnsRecord>();
@@ -904,10 +1159,63 @@ internal static class MdnsRuntime
                 throw new InvalidOperationException("An mDNS record exceeds the maximum supported datagram size.");
             }
 
-            channel.Send(bytes, destination);
+            Transmission transmission;
+            lock (s_gate)
+            {
+                transmission = RecordTransmission(channel.Address.Address, bytes, s_now());
+                try { channel.Send(bytes, destination); }
+                catch
+                {
+                    _ = s_transmissions.Remove(transmission);
+                    throw;
+                }
+            }
         }
         catch (Exception ex) { ReportSendFailure(channel, ex); }
     }
+
+    internal static bool IsOwnPacket(IPEndPoint source, ReadOnlySpan<byte> datagram,
+        IEnumerable<IPAddress> localAddresses, DateTimeOffset now)
+    {
+        lock (s_gate)
+        {
+            PruneTransmissions(now);
+            if (source.Port != 5353)
+            {
+                return false;
+            }
+            byte[] sourceBytes = source.Address.GetAddressBytes();
+            foreach (Transmission item in s_transmissions)
+            {
+                if (item.Source.AsSpan().SequenceEqual(sourceBytes) && item.Datagram.AsSpan().SequenceEqual(datagram))
+                {
+                    return localAddresses.Any(address => SameSourceBytes(address, source.Address));
+                }
+            }
+            return false;
+        }
+    }
+
+    internal static void RememberTransmission(IPAddress source, byte[] datagram, DateTimeOffset now)
+    {
+        lock (s_gate) { _ = RecordTransmission(source, datagram, now); }
+    }
+
+    private static Transmission RecordTransmission(IPAddress source, byte[] datagram, DateTimeOffset now)
+    {
+        PruneTransmissions(now);
+        // A bounded two-second window accommodates bursts from many address channels.
+        if (s_transmissions.Count == 4096) { s_transmissions.RemoveAt(0); }
+        Transmission transmission = new(source.GetAddressBytes(), [.. datagram], now);
+        s_transmissions.Add(transmission);
+        return transmission;
+    }
+
+    private static void PruneTransmissions(DateTimeOffset now) =>
+        s_transmissions.RemoveAll(item => now - item.Sent > s_transmissionLifetime);
+
+    private static bool SameSourceBytes(IPAddress left, IPAddress right) =>
+        left.AddressFamily == right.AddressFamily && left.GetAddressBytes().AsSpan().SequenceEqual(right.GetAddressBytes());
 
     private static void ReportSendFailure(MdnsChannel channel, Exception exception)
     {
@@ -917,6 +1225,7 @@ internal static class MdnsRuntime
                          ScopeIncludesChannel(r.Scope, channel)))
             {
                 s_logSendFailure(registration.Logger, channel.Address.Address, exception);
+                registration.SendFailures++;
                 if (registration.Scope.NetworkInterfaceId is not null || registration.Scope.LocalAddress is not null)
                 {
                     registration.Failure = exception.Message;
@@ -940,8 +1249,9 @@ internal sealed class MdnsChannel : IDisposable
     private static readonly object s_membershipGate = new();
     private static readonly Dictionary<(Socket Receiver, AddressFamily Family, int Index),
         (int References, IPAddress LocalAddress)> s_memberships = [];
-    private readonly Socket _sender;
+    private readonly Socket? _sender;
     private readonly Socket? _receiver;
+    private readonly Action<MdnsAddress, byte[], IPEndPoint?>? _testSend;
     private readonly object _sendGate = new();
     private bool _hasMembership;
     private bool _disposed;
@@ -988,6 +1298,15 @@ internal sealed class MdnsChannel : IDisposable
             ReleaseMembership();
             throw;
         }
+    }
+
+    internal MdnsChannel(MdnsAddress address, Action<MdnsAddress, byte[], IPEndPoint?> testSend)
+    {
+        Address = address;
+        Group = address.Address.AddressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Parse("224.0.0.251") : IPAddress.Parse("ff02::fb");
+        _testSend = testSend;
+        ReceiveTask = Task.CompletedTask;
     }
 
     internal static int MembershipCount(Socket receiver, AddressFamily family, int index)
@@ -1075,10 +1394,15 @@ internal sealed class MdnsChannel : IDisposable
     {
         lock (_sendGate)
         {
+            if (_testSend is not null)
+            {
+                _testSend(Address, bytes, destination);
+                return;
+            }
             IPEndPoint target = destination ?? new IPEndPoint(
                 Address.Address.AddressFamily == AddressFamily.InterNetworkV6
                     ? new IPAddress(Group.GetAddressBytes(), Address.InterfaceIndex) : Group, 5353);
-            _ = _sender.SendTo(bytes, target);
+            _ = _sender!.SendTo(bytes, target);
         }
     }
 
@@ -1090,7 +1414,7 @@ internal sealed class MdnsChannel : IDisposable
         }
 
         _disposed = true;
-        _sender.Dispose();
+        _sender?.Dispose();
         ReleaseMembership();
     }
 }

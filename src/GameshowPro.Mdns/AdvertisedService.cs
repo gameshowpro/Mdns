@@ -18,21 +18,39 @@ public class AdvertisedService : IAsyncDisposable
     {
         _properties = instanceProperties ?? throw new ArgumentNullException(nameof(instanceProperties));
         ArgumentNullException.ThrowIfNull(options);
+        if (options.LocalAddress is not null && options.LocalAddresses is not null)
+        {
+            throw new ArgumentException("LocalAddress and LocalAddresses cannot be supplied together.", nameof(options));
+        }
+
+        if ((options.NetworkInterfaceId is null) !=
+            (options.LocalAddress is null && options.LocalAddresses is null))
+        {
+            throw new ArgumentException("NetworkInterfaceId requires LocalAddress or LocalAddresses, and vice versa.",
+                nameof(options));
+        }
+
+        if (options.LocalAddresses is { Count: 0 })
+        {
+            throw new ArgumentException("LocalAddresses cannot be empty.", nameof(options));
+        }
+
+        if (options.LocalAddresses?.Any(address => address is null) == true)
+        {
+            throw new ArgumentException("LocalAddresses cannot contain a null address.", nameof(options));
+        }
+
         _options = new AdvertisedServiceOptions
         {
             InstanceName = options.InstanceName,
             HostName = options.HostName,
             NetworkInterfaceId = options.NetworkInterfaceId,
-            LocalAddress = options.LocalAddress,
+            LocalAddress = options.LocalAddress is { } address ? CloneAddress(address) : null,
+            LocalAddresses = options.LocalAddresses?.Select(CloneAddress).ToImmutableArray(),
             TxtProperties = options.TxtProperties?.ToFrozenDictionary(pair => pair.Key, pair => pair.Value,
                 StringComparer.OrdinalIgnoreCase),
         };
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        if ((_options.NetworkInterfaceId is null) != (_options.LocalAddress is null))
-        {
-            throw new ArgumentException("NetworkInterfaceId and LocalAddress must be supplied together.", nameof(options));
-        }
-
         if (_options.NetworkInterfaceId is { Length: 0 })
         {
             throw new ArgumentException("NetworkInterfaceId cannot be empty.", nameof(options));
@@ -48,6 +66,12 @@ public class AdvertisedService : IAsyncDisposable
             throw new ArgumentException("LocalAddress must be IPv4 or IPv6.", nameof(options));
         }
 
+        if (_options.LocalAddresses?.Any(address => address.AddressFamily is not
+            (System.Net.Sockets.AddressFamily.InterNetwork or System.Net.Sockets.AddressFamily.InterNetworkV6)) == true)
+        {
+            throw new ArgumentException("LocalAddresses must contain only IPv4 or IPv6 addresses.", nameof(options));
+        }
+
         if (_options.HostName is { } hostName && !IsValidHostLabel(hostName))
         {
             throw new ArgumentException(
@@ -59,6 +83,11 @@ public class AdvertisedService : IAsyncDisposable
     private static bool IsValidHostLabel(string label) =>
         label.Length is >= 1 and <= 63 && label[0] != '-' && label[^1] != '-' &&
         label.All(c => c is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-');
+
+    private static IPAddress CloneAddress(IPAddress address) => address.AddressFamily ==
+        System.Net.Sockets.AddressFamily.InterNetworkV6
+            ? new IPAddress(address.GetAddressBytes(), address.ScopeId)
+            : new IPAddress(address.GetAddressBytes());
 
     public string? Failure => _registration?.Failure ?? Volatile.Read(ref _failure);
 
@@ -90,7 +119,7 @@ public class AdvertisedService : IAsyncDisposable
             try
             {
                 MdnsRegistration registration = await MdnsRuntime.RegisterAsync(publication,
-                    new MdnsScope(_options.NetworkInterfaceId, _options.LocalAddress), _logger,
+                    new MdnsScope(_options.NetworkInterfaceId, _options.LocalAddress, _options.LocalAddresses), _logger,
                     cancellationToken).ConfigureAwait(false);
                 if (registration.Failure is { } failure)
                 {

@@ -35,9 +35,29 @@ await using AdvertisedService publisher = new(
 await publisher.StartAsync(stoppingToken);
 ```
 
-`HostName` is optional. It is a single DNS label (`a-z`, `0-9`, `-`; 1 to 63 characters; no leading or trailing `-`; letters in either case, published as given). When set, the SRV target and the A/AAAA records use `<HostName>.local`, so the name answers address queries directly. Services in one process that share a `HostName` (for example `_https._tcp` and `_http._tcp`) share its address records: they do not conflict with each other, and withdrawing one keeps the addresses live for the other. Choose a `HostName` that no other process or machine owns. Unset, the host stays `<InstanceName>.<service>.local` as before. An invalid label throws `ArgumentException` from the constructor.
+If the service is reachable on several addresses of the same adapter, use `LocalAddresses` to publish the complete configured set with one registration. It requires `NetworkInterfaceId`, must be nonempty, and cannot be combined with `LocalAddress`. The publisher constructor snapshots the collection and clones its IP addresses. Include every configured IPv4 and IPv6 address, such as an IPv4 address, an IPv6 ULA, and a link-local IPv6 address with its scope ID:
 
-`InstanceName` and `TxtProperties` are optional. The library adds a `machineName` TXT value for localhost filtering. An explicit interface requires its local IPv4 or IPv6 address; omitted scope uses the default eligible interfaces. `StartAsync` reports startup failures as exceptions, and `Failure` exposes a later runtime failure. A disposed publisher cannot restart; create a new one to retry. `AdvertiseUntilCancelled` uses the same publication lifecycle and withdraws on cancellation.
+```csharp
+AdvertisedServiceOptions options = new()
+{
+    InstanceName = "Soundling-host-project-listener",
+    NetworkInterfaceId = selectedNic.Id,
+    LocalAddresses = new IPAddress[]
+    {
+        IPAddress.Parse("192.0.2.10"),
+        IPAddress.Parse("fd00::10"),
+        IPAddress.Parse("fe80::10%12"),
+    },
+};
+```
+
+When either same-host registration uses `LocalAddresses`, conflict checks compare the currently available selected addresses on each shared adapter; unavailable configured addresses do not participate. Order and duplicates do not matter. If sets differ, the existing active registration is retained and the new registration fails to start. Checks run again on network topology changes before announcements: if previously compatible sets diverge, the earlier registration is retained and the later one stops publishing until compatibility returns. Legacy registrations using only `LocalAddress` retain their existing asymmetric conflict behavior: adding a single address after a registration containing it can succeed, while the reverse order can conflict. Consumers should still specify the same complete configured scope for every service sharing a host and adapter, so their scopes do not diverge when addresses become available or disappear. When intentionally changing scopes, withdraw old handles across all services before registering replacements.
+
+`HostName` is optional. It is a single DNS label (`a-z`, `0-9`, `-`; 1 to 63 characters; no leading or trailing `-`; letters in either case, published as given). When set, the SRV target and the A/AAAA records use `<HostName>.local`, so the name answers address queries directly. Services in one process that share a `HostName` (for example `_https._tcp` and `_http._tcp`) share its address records when their scopes agree: they do not conflict with each other, and withdrawing one keeps the addresses live for the other. Choose a `HostName` that no other process or machine owns. Unset, the host stays `<InstanceName>.<service>.local` as before. An invalid label throws `ArgumentException` from the constructor.
+
+`InstanceName` and `TxtProperties` are optional. The library adds a `machineName` TXT value for localhost filtering. An explicit interface requires `LocalAddress` or `LocalAddresses`; omitted scope uses the default eligible interfaces. For `LocalAddresses`, runtime publication follows the configured addresses that are currently available on the selected adapter. Removed addresses are withdrawn, and newly available addresses are not included unless configured. Adapter and address reconciliation polls every 10 seconds; topology changes are checked before announcements. `StartAsync` reports startup failures as exceptions, and `Failure` exposes a later runtime failure. A conflicted active registration retries after 10 quiet seconds, probes three times 250 ms apart, and resumes after a successful retry; a continuing conflict leaves it failed. A handle started with `StartAsync` can recover automatically. `AdvertiseUntilCancelled` fails fast on startup failure and throws if a later `Failure` occurs, then disposes the registration, so it does not provide that automatic recovery. A disposed publisher cannot restart; create a new one to retry.
+
+The runtime suppresses packet comparisons for recently transmitted datagrams with matching bytes, source local address, and source port 5353. The history lasts two seconds and holds up to 4096 transmissions. IPv6 scope IDs are ignored for source matching because the receiving adapter can differ. Other datagrams undergo the normal DNS record conflict checks. UDP provides no process identity, so a byte-identical copy from the same endpoint during the history window cannot be distinguished from the runtime's own transmission.
 
 ## Find services
 
@@ -56,7 +76,7 @@ IMdnsMatchedServicesMonitor monitor = finder.Services[profile];
 
 The monitor keeps current hosts, ports, and addresses from PTR, SRV, TXT, A, and AAAA records, including records that arrive in separate packets. Records expire by their DNS TTL; withdrawals use the standard one-second goodbye grace. `ConflictMonitor` combines the existing publication and discovery contracts for applications that need to find other instances of their own service type.
 
-The library targets `net10.0` and `net10.0-windows` (the Windows configurations retain WPF support), with C# 14 pinned in the project and test projects. Soundling's `net11.0` projects also pin C# 14. Deployment validation, cross-platform network runs, and interoperability checks with third-party applications remain future work.
+The library targets `net11.0` and `net11.0-windows` (the Windows configurations retain WPF support), with C# 14 pinned in the project and test projects. Deployment validation, cross-platform network runs, and interoperability checks with third-party applications remain future work.
 
 ## Network limits
 

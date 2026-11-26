@@ -1,6 +1,7 @@
 namespace GameshowPro.Mdns.Internal;
 
-internal sealed record MdnsScope(string? NetworkInterfaceId = null, IPAddress? LocalAddress = null);
+internal sealed record MdnsScope(string? NetworkInterfaceId = null, IPAddress? LocalAddress = null,
+    IReadOnlyCollection<IPAddress>? LocalAddresses = null);
 internal sealed record MdnsPublication(string InstanceName, string ServiceType, string Protocol,
     ushort Port, IReadOnlyDictionary<string, string> TxtProperties, string? HostName = null);
 internal sealed record MdnsPacket(DnsMessage Message, int InterfaceIndex, IPAddress Destination, IPAddress Source);
@@ -36,7 +37,8 @@ internal static class MdnsEngine
         records.Add(new(instance, DnsTypes.Srv, 0x8001, UniqueTtl,
             new SrvData(0, 0, publication.Port, host)));
         records.Add(new(instance, DnsTypes.Txt, 0x8001, UniqueTtl, new TxtData(txt)));
-        foreach (IPAddress address in addresses.Distinct())
+        foreach (IPAddress address in addresses.DistinctBy(address =>
+            (address.AddressFamily, Convert.ToHexString(address.GetAddressBytes()))))
         {
             records.Add(new(host, address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
                 ? DnsTypes.A : DnsTypes.Aaaa, 0x8001, UniqueTtl, new AddressData(address)));
@@ -126,7 +128,7 @@ internal static class MdnsEngine
 
     private static string DataKey(DnsData data) => data switch
     {
-        AddressData address => address.Address.ToString(),
+        AddressData address => $"{address.Address.AddressFamily}|{Convert.ToHexString(address.Address.GetAddressBytes())}",
         NameData name => DnsNames.Canonical(name.Name).ToUpperInvariant(),
         SrvData srv => $"{srv.Priority}|{srv.Weight}|{srv.Port}|{DnsNames.Canonical(srv.Target).ToUpperInvariant()}",
         TxtData txt => string.Join("|", txt.Strings.Select(Convert.ToHexString)),
