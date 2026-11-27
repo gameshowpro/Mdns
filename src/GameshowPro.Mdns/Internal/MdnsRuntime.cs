@@ -60,6 +60,9 @@ internal static class MdnsRuntime
     private static readonly Action<ILogger, IPAddress, Exception?> s_logInterfaceUnavailable =
         LoggerMessage.Define<IPAddress>(LogLevel.Warning, new EventId(1, nameof(s_logInterfaceUnavailable)),
             "mDNS interface {Address} is unavailable");
+    private static readonly Action<ILogger, IPAddress, Exception?> s_logAddressNotReadyForBind =
+        LoggerMessage.Define<IPAddress>(LogLevel.Debug, new EventId(7, nameof(s_logAddressNotReadyForBind)),
+            "mDNS address {Address} is not ready for socket binding");
     private static readonly Action<ILogger, AddressFamily, Exception?> s_logReceiveFailure =
         LoggerMessage.Define<AddressFamily>(LogLevel.Warning, new EventId(2, nameof(s_logReceiveFailure)),
             "mDNS receive failed on {Family}");
@@ -428,7 +431,14 @@ internal static class MdnsRuntime
             {
                 foreach (MdnsRegistration registration in s_registrations.Where(r => Select(available, r.Scope).Any(x => x.Key == endpoint.Key)))
                 {
-                    s_logInterfaceUnavailable(registration.Logger, endpoint.Address, ex);
+                    if (ex is SocketException { SocketErrorCode: SocketError.AddressNotAvailable })
+                    {
+                        s_logAddressNotReadyForBind(registration.Logger, endpoint.Address, ex);
+                    }
+                    else
+                    {
+                        s_logInterfaceUnavailable(registration.Logger, endpoint.Address, ex);
+                    }
                 }
             }
         }
@@ -532,11 +542,6 @@ internal static class MdnsRuntime
         // Keep loopback available for an explicitly selected scope and for machines
         // whose only usable network is loopback.
         return result;
-    }
-
-    private static IEnumerable<IPAddress> CurrentLocalAddresses()
-    {
-        foreach (MdnsAddress address in EnumerateAddresses()) { yield return address.Address; }
     }
 
     internal static IDisposable InstallTestTransport(IReadOnlyList<MdnsAddress> addresses,
@@ -784,6 +789,7 @@ internal static class MdnsRuntime
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
             catch (SocketException) when (cancellationToken.IsCancellationRequested) { break; }
+            catch (Exception) when (cancellationToken.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
                 ReportReceiveFailure(socket, ex);
@@ -829,7 +835,8 @@ internal static class MdnsRuntime
         MdnsBrowseSubscription[] browsers;
         lock (s_gate)
         {
-            bool ownPacket = IsOwnPacket(source, datagram, CurrentLocalAddresses(), s_now());
+            List<MdnsAddress> available = EnumerateAddresses();
+            bool ownPacket = IsOwnPacket(source, datagram, available.Select(address => address.Address), s_now());
             channels = [.. s_channels.Values.Where(c => c.Address.InterfaceIndex == interfaceIndex &&
                 (destination.Equals(c.Address.Address) || IsGroupDestination(destination, c.Group)))];
             if (channels.Length == 0)
@@ -840,12 +847,13 @@ internal static class MdnsRuntime
             browsers = [.. s_browsers.Where(b => !b.Disposed)];
             if (!ownPacket && (message.IsResponse || source.Port == 5353 && !message.Authorities.IsEmpty))
             {
+                DnsMessage conflictMessage = FilterCurrentOwnedAddresses(message, source, available);
                 foreach (MdnsRegistration registration in s_registrations.Where(r => !r.Disposed &&
                              (r.Failure is null || r.Conflict || r.Recovering)))
                 {
                     if ((!registration.Active || message.IsResponse) &&
                         channels.Any(channel => ScopeIncludesChannel(registration.Scope, channel) &&
-                        MdnsEngine.HasConflict(message, RecordsForInterface(registration, channel))))
+                        MdnsEngine.HasConflict(conflictMessage, RecordsForInterface(registration, channel))))
                     {
                         DateTimeOffset now = s_now();
                         if (registration.Conflict)
@@ -905,6 +913,43 @@ internal static class MdnsRuntime
                 Respond(channel, message with { Questions = unicast }, source);
             }
         }
+    }
+
+    private static DnsMessage FilterCurrentOwnedAddresses(DnsMessage message, IPEndPoint source,
+        IReadOnlyCollection<MdnsAddress> available)
+    {
+        if (source.Port != 5353 || !available.Any(address => SameSourceBytes(address.Address, source.Address)))
+        {
+            return message;
+        }
+
+        // A delayed or repacked multicast echo can outlive the exact-datagram history.
+        // Only address records still selected and backed by a live channel are ours.
+        List<DnsRecord> owned = [];
+        foreach (MdnsRegistration registration in s_registrations.Where(r => !r.Disposed &&
+                     (r.Active || r.Recovering && !HasLocalConflict(r) ||
+                      !r.EverActive && r.Failure is null)))
+        {
+            foreach (IGrouping<string, MdnsAddress> selected in Select(available, registration.Scope)
+                         .Where(address => s_channels.ContainsKey(address.Key))
+                         .GroupBy(address => address.InterfaceId, StringComparer.OrdinalIgnoreCase))
+            {
+                owned.AddRange(MdnsEngine.CreateRecords(registration.Publication,
+                    [.. selected.Select(address => address.Address)]).Where(record =>
+                    record.Type is DnsTypes.A or DnsTypes.Aaaa));
+            }
+        }
+
+        bool IsCurrentOwnedAddress(DnsRecord record) =>
+            record.Type is DnsTypes.A or DnsTypes.Aaaa && record.Data is AddressData &&
+            owned.Any(candidate => DnsRecords.Equivalent(candidate, record));
+
+        return message with
+        {
+            Answers = [.. message.Answers.Where(record => !IsCurrentOwnedAddress(record))],
+            Authorities = [.. message.Authorities.Where(record => !IsCurrentOwnedAddress(record))],
+            Additionals = [.. message.Additionals.Where(record => !IsCurrentOwnedAddress(record))]
+        };
     }
 
     private static void Respond(MdnsChannel channel, DnsMessage message, IPEndPoint source)
@@ -1251,6 +1296,7 @@ internal sealed class MdnsChannel : IDisposable
         (int References, IPAddress LocalAddress)> s_memberships = [];
     private readonly Socket? _sender;
     private readonly Socket? _receiver;
+    private readonly CancellationTokenSource? _channelStop;
     private readonly Action<MdnsAddress, byte[], IPEndPoint?>? _testSend;
     private readonly object _sendGate = new();
     private bool _hasMembership;
@@ -1290,10 +1336,12 @@ internal sealed class MdnsChannel : IDisposable
             }
             AcquireMembership();
             _sender.Bind(new IPEndPoint(address.Address, 5353));
-            ReceiveTask = receiveLoop(_sender, stop);
+            _channelStop = CancellationTokenSource.CreateLinkedTokenSource(stop);
+            ReceiveTask = receiveLoop(_sender, _channelStop.Token);
         }
         catch
         {
+            _channelStop?.Dispose();
             _sender.Dispose();
             ReleaseMembership();
             throw;
@@ -1414,7 +1462,9 @@ internal sealed class MdnsChannel : IDisposable
         }
 
         _disposed = true;
+        _channelStop?.Cancel();
         _sender?.Dispose();
         ReleaseMembership();
+        _channelStop?.Dispose();
     }
 }

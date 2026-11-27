@@ -11,6 +11,7 @@ public sealed class MdnsRuntimeAddressSetTests
         internal List<MdnsAddress> Addresses { get; }
         internal List<(MdnsAddress Channel, byte[] Bytes)> Sent { get; } = [];
         internal DateTimeOffset Now { get; private set; } = DateTimeOffset.UtcNow;
+        internal bool HoldProbeDelays { get; set; }
 
         internal FakeTransport(params MdnsAddress[] addresses)
         {
@@ -29,7 +30,7 @@ public sealed class MdnsRuntimeAddressSetTests
 
         private Task Delay(TimeSpan duration)
         {
-            if (duration < TimeSpan.FromSeconds(1)) { return Task.CompletedTask; }
+            if (duration < TimeSpan.FromSeconds(1) && !HoldProbeDelays) { return Task.CompletedTask; }
             TaskCompletionSource source = new(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (_gate) { _delays.Add((Now + duration, source)); }
             return source.Task;
@@ -46,6 +47,11 @@ public sealed class MdnsRuntimeAddressSetTests
                 }
                 _ = _delays.RemoveAll(item => item.Due <= Now);
             }
+        }
+
+        internal void AdvanceClock(TimeSpan duration)
+        {
+            lock (_gate) { Now += duration; }
         }
 
         internal (MdnsAddress Channel, byte[] Bytes)[] Snapshot()
@@ -69,6 +75,216 @@ public sealed class MdnsRuntimeAddressSetTests
     {
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(3));
         while (!predicate()) { await Task.Delay(10, timeout.Token); }
+    }
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
+    public async Task DelayedOwnAddressEchoSurvivesTwoSecondsAcrossAdapters(
+        bool scoped, bool ipv6Source, bool secondAdapterJoins)
+    {
+        IPAddress first4 = IPAddress.Parse("192.0.2.110");
+        IPAddress firstUla = IPAddress.Parse("fd00::110");
+        IPAddress first6 = new(IPAddress.Parse("fe80::110").GetAddressBytes(), 11);
+        IPAddress second4 = IPAddress.Parse("192.0.2.120");
+        IPAddress secondUla = IPAddress.Parse("fd00::120");
+        IPAddress second6 = new(IPAddress.Parse("fe80::120").GetAddressBytes(), 12);
+        using FakeTransport fake = new(new MdnsAddress("one", 11, first4),
+            new MdnsAddress("one", 11, firstUla), new MdnsAddress("one", 11, first6));
+        if (!secondAdapterJoins)
+        {
+            fake.Addresses.Add(new MdnsAddress("two", 12, second4));
+            fake.Addresses.Add(new MdnsAddress("two", 12, secondUla));
+            fake.Addresses.Add(new MdnsAddress("two", 12, second6));
+        }
+        string host = "delay-" + Guid.NewGuid().ToString("N")[..6];
+        MdnsPublication tls = Publication(host);
+        MdnsPublication soundling = tls with { InstanceName = "soundling-" + host,
+            ServiceType = "_soundling", Port = 49421 };
+        List<MdnsRegistration> registrations = [];
+        try
+        {
+            foreach (MdnsPublication publication in new[] { tls, soundling })
+            {
+                registrations.Add(await MdnsRuntime.RegisterAsync(publication,
+                    scoped ? new MdnsScope("one", null, [first4, firstUla, first6]) : new MdnsScope(), NullLogger.Instance));
+            }
+            if (secondAdapterJoins)
+            {
+                fake.Addresses.Add(new MdnsAddress("two", 12, second4));
+                fake.Addresses.Add(new MdnsAddress("two", 12, secondUla));
+                fake.Addresses.Add(new MdnsAddress("two", 12, second6));
+                MdnsRuntime.ReconcileForTest();
+            }
+            if (scoped)
+            {
+                foreach (MdnsPublication publication in new[] { tls, soundling })
+                {
+                    registrations.Add(await MdnsRuntime.RegisterAsync(publication,
+                        new MdnsScope("two", null, [second4, secondUla, second6]), NullLogger.Instance));
+                }
+            }
+            Assert.All(registrations, registration => Assert.Null(registration.Failure));
+            IPAddress source = ipv6Source
+                ? new IPAddress(first6.GetAddressBytes(), 12) : first4;
+            ImmutableArray<DnsRecord> firstAddressRecords = [.. MdnsEngine.CreateRecords(tls, [first4, firstUla, first6])
+                .Where(record => record.Type is DnsTypes.A or DnsTypes.Aaaa)];
+            byte[] delayed = DnsCodec.Write(new DnsMessage { Flags = 0x8400, Answers = firstAddressRecords });
+            MdnsRuntime.RememberTransmission(ipv6Source ? first6 : first4, delayed, fake.Now);
+            fake.Advance(TimeSpan.FromSeconds(3));
+            Assert.False(MdnsRuntime.IsOwnPacket(new IPEndPoint(source, 5353), delayed,
+                [first4, firstUla, first6, second4, secondUla, second6], fake.Now));
+            IPAddress destination = IPAddress.Parse(ipv6Source ? "ff02::fb" : "224.0.0.251");
+            MdnsRuntime.DispatchForTest(delayed, 12, destination,
+                new IPEndPoint(source, 5353));
+            MdnsRuntime.DispatchForTest(delayed, 12, destination,
+                new IPEndPoint(source, 5353));
+            Assert.All(registrations, registration =>
+            {
+                Assert.Null(registration.LastConflict);
+                Assert.True(registration.Active);
+                Assert.Null(registration.Failure);
+            });
+        }
+        finally
+        {
+            foreach (MdnsRegistration registration in registrations)
+            {
+                await registration.DisposeAsync();
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("remote-address")]
+    [InlineData("local-address")]
+    [InlineData("local-txt")]
+    [InlineData("local-srv")]
+    [InlineData("owned-address-plus-txt")]
+    public async Task DelayedOwnFilteringPreservesRealConflicts(string scenario)
+    {
+        IPAddress first = IPAddress.Parse("192.0.2.130");
+        IPAddress second = IPAddress.Parse("198.51.100.131");
+        IPAddress unknown = IPAddress.Parse("203.0.113.132");
+        using FakeTransport fake = new(new MdnsAddress("one", 13, first), new MdnsAddress("two", 14, second));
+        MdnsPublication publication = Publication("negative-" + Guid.NewGuid().ToString("N")[..6]);
+        await using MdnsRegistration registration = await MdnsRuntime.RegisterAsync(publication,
+            new MdnsScope(), NullLogger.Instance);
+        Assert.Null(registration.Failure);
+        fake.Advance(TimeSpan.FromSeconds(3));
+        ImmutableArray<DnsRecord> ours = MdnsEngine.CreateRecords(publication, [first]);
+        DnsRecord ownedAddress = Assert.Single(ours.Where(record => record.Type == DnsTypes.A));
+        DnsRecord conflicting = scenario switch
+        {
+            "remote-address" or "local-address" => ownedAddress with { Data = new AddressData(unknown) },
+            "local-txt" or "owned-address-plus-txt" => Assert.Single(ours.Where(record => record.Type == DnsTypes.Txt))
+                with { Data = new TxtData([Encoding.UTF8.GetBytes("other=process")]) },
+            _ => Assert.Single(ours.Where(record => record.Type == DnsTypes.Srv))
+                with { Data = new SrvData(0, 0, 49422, publication.HostName + ".local.") }
+        };
+        byte[] bytes = DnsCodec.Write(new DnsMessage { Flags = 0x8400,
+            Answers = scenario == "owned-address-plus-txt" ? [ownedAddress, conflicting] : [conflicting] });
+        IPEndPoint source = new(scenario == "remote-address" ? unknown : first, 5353);
+        MdnsRuntime.DispatchForTest(bytes, 14, IPAddress.Parse("224.0.0.251"), source);
+        _ = Assert.NotNull(registration.LastConflict);
+        MdnsRuntime.DispatchForTest(bytes, 14, IPAddress.Parse("224.0.0.251"), source);
+        Assert.True(registration.Conflict);
+        Assert.NotNull(registration.Failure);
+    }
+
+    [Fact]
+    public async Task DelayedCrossAdapterAddressProbeDoesNotRejectStartingScopedRegistration()
+    {
+        IPAddress first = new(IPAddress.Parse("fe80::140").GetAddressBytes(), 15);
+        IPAddress second = new(IPAddress.Parse("fe80::141").GetAddressBytes(), 16);
+        using FakeTransport fake = new(new MdnsAddress("one", 15, first), new MdnsAddress("two", 16, second));
+        string host = "probe-" + Guid.NewGuid().ToString("N")[..6];
+        MdnsPublication firstPublication = Publication(host);
+        MdnsPublication secondPublication = firstPublication with { InstanceName = "other-" + host,
+            ServiceType = "_otherfake" };
+        await using MdnsRegistration existing = await MdnsRuntime.RegisterAsync(firstPublication,
+            new MdnsScope("one", null, [first]), NullLogger.Instance);
+        Assert.Null(existing.Failure);
+        fake.HoldProbeDelays = true;
+        Task<MdnsRegistration> pending = MdnsRuntime.RegisterAsync(secondPublication,
+            new MdnsScope("two", null, [second]), NullLogger.Instance);
+        await Until(() => fake.Snapshot().Any(packet => packet.Channel.InterfaceIndex == 16 &&
+            DnsCodec.TryRead(packet.Bytes, out DnsMessage? message) &&
+            !message!.Authorities.IsEmpty));
+        DnsRecord address = Assert.Single(MdnsEngine.CreateRecords(firstPublication, [first])
+            .Where(record => record.Type == DnsTypes.Aaaa));
+        byte[] delayed = DnsCodec.Write(new DnsMessage { Authorities = [address] });
+        MdnsRuntime.RememberTransmission(first, delayed, fake.Now);
+        fake.AdvanceClock(TimeSpan.FromSeconds(3));
+        Assert.False(MdnsRuntime.IsOwnPacket(new IPEndPoint(new IPAddress(first.GetAddressBytes(), 16), 5353),
+            delayed, [first, second], fake.Now));
+        MdnsRuntime.DispatchForTest(delayed, 16, IPAddress.Parse("ff02::fb"),
+            new IPEndPoint(new IPAddress(first.GetAddressBytes(), 16), 5353));
+        for (int i = 0; i < 4 && !pending.IsCompleted; i++)
+        {
+            fake.Advance(TimeSpan.FromSeconds(1));
+            await Task.Delay(10);
+        }
+        await using MdnsRegistration starting = await pending.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Null(starting.Failure);
+        Assert.True(starting.Active);
+        Assert.Null(existing.LastConflict);
+    }
+
+    [Fact]
+    public async Task LocalSourceDoesNotExcuseAnAddressOutsideCurrentScopedSet()
+    {
+        IPAddress sourceAddress = IPAddress.Parse("192.0.2.151");
+        IPAddress publishedAddress = IPAddress.Parse("192.0.2.152");
+        using FakeTransport fake = new(new MdnsAddress("same", 17, sourceAddress),
+            new MdnsAddress("same", 17, publishedAddress));
+        MdnsPublication publication = Publication("narrow-" + Guid.NewGuid().ToString("N")[..6]);
+        await using MdnsRegistration registration = await MdnsRuntime.RegisterAsync(publication,
+            new MdnsScope("same", null, [publishedAddress]), NullLogger.Instance);
+        Assert.Null(registration.Failure);
+        fake.Advance(TimeSpan.FromSeconds(3));
+        DnsRecord unpublished = Assert.Single(MdnsEngine.CreateRecords(publication, [sourceAddress])
+            .Where(record => record.Type == DnsTypes.A));
+        byte[] bytes = DnsCodec.Write(new DnsMessage { Flags = 0x8400, Answers = [unpublished] });
+        IPEndPoint source = new(sourceAddress, 5353);
+        MdnsRuntime.DispatchForTest(bytes, 17, IPAddress.Parse("224.0.0.251"), source);
+        _ = Assert.NotNull(registration.LastConflict);
+        MdnsRuntime.DispatchForTest(bytes, 17, IPAddress.Parse("224.0.0.251"), source);
+        Assert.True(registration.Conflict);
+    }
+
+    [Fact]
+    public async Task RejectedLocalRegistrationDoesNotOwnItsAddressForConflictFiltering()
+    {
+        IPAddress first = IPAddress.Parse("192.0.2.161");
+        IPAddress second = IPAddress.Parse("192.0.2.162");
+        using FakeTransport fake = new(new MdnsAddress("same", 18, first),
+            new MdnsAddress("same", 18, second));
+        string host = "rejected-" + Guid.NewGuid().ToString("N")[..6];
+        MdnsPublication firstPublication = Publication(host);
+        MdnsPublication rejectedPublication = firstPublication with { InstanceName = "other-" + host,
+            ServiceType = "_otherfake" };
+        await using MdnsRegistration active = await MdnsRuntime.RegisterAsync(firstPublication,
+            new MdnsScope("same", null, [first]), NullLogger.Instance);
+        await using MdnsRegistration rejected = await MdnsRuntime.RegisterAsync(rejectedPublication,
+            new MdnsScope("same", null, [second]), NullLogger.Instance);
+        Assert.Null(active.Failure);
+        Assert.NotNull(rejected.Failure);
+        fake.Advance(TimeSpan.FromSeconds(3));
+        DnsRecord address = Assert.Single(MdnsEngine.CreateRecords(rejectedPublication, [second])
+            .Where(record => record.Type == DnsTypes.A));
+        byte[] bytes = DnsCodec.Write(new DnsMessage { Flags = 0x8400, Answers = [address] });
+        IPEndPoint source = new(first, 5353);
+        MdnsRuntime.DispatchForTest(bytes, 18, IPAddress.Parse("224.0.0.251"), source);
+        _ = Assert.NotNull(active.LastConflict);
+        MdnsRuntime.DispatchForTest(bytes, 18, IPAddress.Parse("224.0.0.251"), source);
+        Assert.True(active.Conflict);
     }
 
     [Fact]

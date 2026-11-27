@@ -357,6 +357,36 @@ public sealed class MdnsRuntimeTests
         Assert.Equal(0, MdnsChannel.MembershipCount(receiver, AddressFamily.InterNetworkV6, index));
     }
 
+    [Fact]
+    public async Task DisposingChannelCancelsItsReceiveLoopWithoutStoppingSharedReceiver()
+    {
+        (NetworkInterface Nic, IPAddress Address) loopback = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up)
+            .SelectMany(n => n.GetIPProperties().UnicastAddresses
+                .Where(a => a.Address.Equals(IPAddress.Loopback))
+                .Select(a => (Nic: n, Address: a.Address))).FirstOrDefault();
+        if (loopback.Nic is null)
+        {
+            throw Xunit.Sdk.SkipException.ForSkip("No active IPv4 loopback interface is available.");
+        }
+
+        int index = loopback.Nic.GetIPProperties().GetIPv4Properties()!.Index;
+        using Socket receiver = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        receiver.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        receiver.Bind(new IPEndPoint(IPAddress.Any, 5353));
+        using CancellationTokenSource runtimeStop = new();
+        using MdnsChannel channel = new(new MdnsAddress(loopback.Nic.Id, index, loopback.Address), receiver,
+            async (_, token) =>
+            {
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+            }, runtimeStop.Token);
+        Assert.False(channel.ReceiveTask.IsCompleted);
+        channel.Dispose();
+        await channel.ReceiveTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(runtimeStop.IsCancellationRequested);
+    }
+
     private static async Task<ImmutableArray<DnsRecord>> Query(UdpClient probe, IPAddress address,
         string serviceType, int expected)
     {
